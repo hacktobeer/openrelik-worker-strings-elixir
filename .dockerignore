@@ -1,0 +1,11 @@
+_build
+deps
+tmp
+.git
+.github
+.vscode
+.devcontainer
+openrelik-worker-common
+openrelik-worker-strings
+*.ez
+erl_crash.dump
