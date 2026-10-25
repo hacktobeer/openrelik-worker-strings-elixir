@@ -1,4 +1,4 @@
-defmodule Src.App do
+defmodule OpenrelikWorkerStrings.CeleryApp do
   @moduledoc """
   Celery application and worker configuration for `openrelik-worker-strings`
   (Elixir port of `src/app.py`).
@@ -14,7 +14,7 @@ defmodule Src.App do
      OpenRelik Server discovers registered tasks via Celery's `inspect.registered`
      control command and automatically routes each task to the queue matching the
      first segment of its task name (`task_name.split(".")[0]`).
-     Because the task name in `Src.Tasks` is `"openrelik-worker-strings.tasks.strings"`,
+     Because the task name in `OpenrelikWorkerStrings.Tasks` is `"openrelik-worker-strings.tasks.strings"`,
      OpenRelik Server routes jobs to the `"openrelik-worker-strings"` queue.
 
   3. **Graceful Shutdown Timeout (`WORKER_SHUTDOWN_TIMEOUT_MS`)**:
@@ -30,12 +30,14 @@ defmodule Src.App do
   alias OpenrelikWorkerStrings.Config
 
   @default_queue "openrelik-worker-strings"
-  @task_modules ["src.tasks"]
+  # Task module loaded into `Celery.Registry` (OpenRelik Server discovers the
+  # worker and its task_config via Celery's `inspect.registered` command).
+  @task_modules [OpenrelikWorkerStrings.Tasks]
 
   @doc """
   Returns the default OpenRelik queue name (`"openrelik-worker-strings"`).
 
-  In OpenRelik, this must match the prefix of `Src.Tasks.task_name/0` before the
+  In OpenRelik, this must match the prefix of `OpenrelikWorkerStrings.Tasks.task_name/0` before the
   first dot (`"openrelik-worker-strings.tasks.strings"` -> `"openrelik-worker-strings"`).
   """
   @spec default_queue() :: String.t()
@@ -93,7 +95,7 @@ defmodule Src.App do
 
   @doc """
   Builds a `%Celery{}` application instance configured with `REDIS_URL` as both
-  broker and result backend, and `include: ["src.tasks"]`.
+  broker and result backend, and `include: ["OpenrelikWorkerStrings.Tasks"]`.
 
   ## Options
   - `:redis_url` - Explicit Redis URL (defaults to `redis_url/0`).

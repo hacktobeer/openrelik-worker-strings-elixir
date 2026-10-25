@@ -1,7 +1,7 @@
-defmodule Src.Events do
+defmodule OpenrelikWorkerStrings.Events do
   @moduledoc """
   Celery event emission plumbing for OpenRelik workers, extracted from
-  `Src.Tasks` so task modules only call `send_event/3` (matching
+  `OpenrelikWorkerStrings.Tasks` so task modules only call `send_event/3` (matching
   `self.send_event(...)` in Python Celery).
 
   ## Event Flow

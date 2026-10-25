@@ -177,7 +177,7 @@ defmodule OpenrelikWorkerStrings.Config do
   Resolves additional queue names to consume from from the
   `WORKER_QUEUES` environment variable (comma-separated, or `:worker_queues`
   application config as a list). The default OpenRelik queue is always
-  prepended by `Src.App.resolve_queues/1` and should not be included here.
+  prepended by `OpenrelikWorkerStrings.CeleryApp.resolve_queues/1` and should not be included here.
   """
   @spec worker_queues() :: [String.t()]
   def worker_queues do

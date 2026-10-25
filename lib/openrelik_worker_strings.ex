@@ -9,13 +9,13 @@ defmodule OpenrelikWorkerStrings do
     application config resolution (`REDIS_URL`, `WORKER_SHUTDOWN_TIMEOUT_MS`,
     `START_WORKER`/`WORKER_CONCURRENCY`/`WORKER_QUEUES`, `strings(1)` executable
     and progress interval settings).
-  - `Src.App` — Configures the `%Celery{}` application (`REDIS_URL` broker/backend,
+  - `OpenrelikWorkerStrings.CeleryApp` — Configures the `%Celery{}` application (`REDIS_URL` broker/backend,
     `"openrelik-worker-strings"` queue routing, and `WORKER_SHUTDOWN_TIMEOUT_MS`
     graceful shutdown configuration) and builds/starts `Celery.Worker`.
-  - `Src.Tasks` — Defines the `"openrelik-worker-strings.tasks.strings"` Celery task,
+  - `OpenrelikWorkerStrings.Tasks` — Defines the `"openrelik-worker-strings.tasks.strings"` Celery task,
     its OpenRelik UI metadata (`@task_metadata`), subprocess execution, and real-time
     `"task-progress"` event reporting.
-  - `Src.Events` — Celery event emission plumbing (`send_event/3`, matching
+  - `OpenrelikWorkerStrings.Events` — Celery event emission plumbing (`send_event/3`, matching
     `self.send_event(...)` in Python Celery) publishing to the `celeryev` exchange
     for OpenRelik Mediator and Flower.
   - `OpenrelikWorkerCommon` (`:openrelik_worker_common` Hex package) — Shared OpenRelik
@@ -27,13 +27,13 @@ defmodule OpenrelikWorkerStrings do
     with OpenRelik's `docker-compose.yml` worker command format.
   """
 
-  defdelegate default_queue(), to: Src.App
-  defdelegate default_shutdown_timeout_ms(), to: Src.App
-  defdelegate shutdown_timeout_ms(), to: Src.App
-  defdelegate redis_url(), to: Src.App
-  defdelegate celery(opts \\ []), to: Src.App
-  defdelegate worker_child_spec(opts \\ []), to: Src.App
-  defdelegate start_worker(opts \\ []), to: Src.App
-  defdelegate task_name(), to: Src.Tasks
-  defdelegate task_metadata(), to: Src.Tasks
+  defdelegate default_queue(), to: OpenrelikWorkerStrings.CeleryApp
+  defdelegate default_shutdown_timeout_ms(), to: OpenrelikWorkerStrings.CeleryApp
+  defdelegate shutdown_timeout_ms(), to: OpenrelikWorkerStrings.CeleryApp
+  defdelegate redis_url(), to: OpenrelikWorkerStrings.CeleryApp
+  defdelegate celery(opts \\ []), to: OpenrelikWorkerStrings.CeleryApp
+  defdelegate worker_child_spec(opts \\ []), to: OpenrelikWorkerStrings.CeleryApp
+  defdelegate start_worker(opts \\ []), to: OpenrelikWorkerStrings.CeleryApp
+  defdelegate task_name(), to: OpenrelikWorkerStrings.Tasks
+  defdelegate task_metadata(), to: OpenrelikWorkerStrings.Tasks
 end

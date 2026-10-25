@@ -1,4 +1,4 @@
-defmodule Src.Tasks.StringsEncoding do
+defmodule OpenrelikWorkerStrings.Tasks.StringsEncoding do
   @moduledoc """
   Supported string encodings and their corresponding GNU `strings(1)` `--encoding`
   flag values (ported from `StringsEncoding` in `src/tasks.py`).
@@ -50,7 +50,7 @@ defmodule Src.Tasks.StringsEncoding do
   end
 end
 
-defmodule Src.Tasks do
+defmodule OpenrelikWorkerStrings.Tasks do
   @moduledoc """
   OpenRelik Celery task implementation for `openrelik-worker-strings`
   (Elixir port of `src/tasks.py`).
@@ -78,10 +78,10 @@ defmodule Src.Tasks do
 
   4. **Output File Creation (`FileUtils.create_output_file/2`)**:
      Generates a UUID-named file path inside `output_path` on the shared OpenRelik artifact
-     volume while recording the human-readable `display_name` and extension for database
-     registration.
+     volume while recording the human-readable `display_name`, `data_type`, and extension
+     for database registration.
 
-  5. **Real-Time Progress Reporting (`Src.Events.send_event/3`) & Result Encoding** (`TaskUtils.create_task_result/1`):
+  5. **Real-Time Progress Reporting (`OpenrelikWorkerStrings.Events.send_event/3`) & Result Encoding** (`TaskUtils.create_task_result/1`):
      Long-running commands emit `"task-progress"` events over Celery's `celeryev` fanout
      exchange for `openrelik-mediator` and Flower, and return a Base64-encoded JSON result
      string when finished.
@@ -94,8 +94,8 @@ defmodule Src.Tasks do
   alias OpenrelikWorkerCommon.FileUtils.OutputFile
   alias OpenrelikWorkerCommon.TaskUtils
   alias OpenrelikWorkerStrings.Config
-  alias Src.Events
-  alias Src.Tasks.StringsEncoding
+  alias OpenrelikWorkerStrings.Events
+  alias OpenrelikWorkerStrings.Tasks.StringsEncoding
 
   # Task name used to register and route the task to the "openrelik-worker-strings" queue.
   @task_name "openrelik-worker-strings.tasks.strings"
@@ -172,7 +172,7 @@ defmodule Src.Tasks do
     if resolved_input_files == [] do
       Logger.error("Task #{@task_name} (task_id=#{inspect(task_id)}) received no input files")
 
-      raise RuntimeError, "No strings extracted from the provided files."
+      raise RuntimeError, "No input files provided for the strings task."
     end
 
     config_entries = normalize_task_config(task_config)
@@ -291,7 +291,8 @@ defmodule Src.Tasks do
     output_file =
       FileUtils.create_output_file(
         output_path || "",
-        display_name: output_display_name
+        display_name: output_display_name,
+        data_type: "text/plain"
       )
 
     # Flags passed to GNU `strings`:

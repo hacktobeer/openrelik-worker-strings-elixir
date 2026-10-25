@@ -3,7 +3,7 @@ defmodule OpenrelikWorkerStrings.Application do
   OTP Application callback module for `openrelik-worker-strings`.
 
   On startup this application:
-  1. Loads and registers the Celery task module (`Src.Tasks`) in `Celery.Registry`
+  1. Loads and registers the Celery task module (`OpenrelikWorkerStrings.Tasks`) in `Celery.Registry`
      so task definitions and OpenRelik metadata are immediately available.
   2. Starts the top-level `OpenrelikWorkerStrings.Supervisor`.
   3. Optionally starts a supervised `Celery.Worker` child process with a configurable
@@ -17,7 +17,7 @@ defmodule OpenrelikWorkerStrings.Application do
 
   - **CLI Task (recommended / Docker default)**:
     ```bash
-    mix celery.worker --app=src.tasks worker --task-events --concurrency=1 --loglevel=INFO -Q openrelik-worker-strings
+    mix celery.worker --app=OpenrelikWorkerStrings.Tasks worker --task-events --concurrency=1 --loglevel=INFO -Q openrelik-worker-strings
     ```
   - **OTP-Supervised Worker (`mix run --no-halt` or Elixir release)**:
     ```bash
@@ -35,7 +35,7 @@ defmodule OpenrelikWorkerStrings.Application do
     Logger.info("Starting OpenrelikWorkerStrings.Application")
 
     # Ensure the task module is loaded and registered in Celery.Registry on startup
-    Celery.Registry.load_include(Src.Tasks)
+    Celery.Registry.load_include(OpenrelikWorkerStrings.Tasks)
 
     registered_tasks = Map.keys(Celery.Registry.all())
     Logger.info("Registered Celery tasks: #{inspect(registered_tasks)}")
@@ -43,7 +43,7 @@ defmodule OpenrelikWorkerStrings.Application do
     children =
       if Config.start_worker?() and not Config.cli_worker_mode?() do
         concurrency = Config.worker_concurrency()
-        queues = Src.App.resolve_queues(Config.worker_queues())
+        queues = OpenrelikWorkerStrings.CeleryApp.resolve_queues(Config.worker_queues())
         shutdown_timeout = Config.shutdown_timeout_ms()
 
         Logger.info(
@@ -53,7 +53,7 @@ defmodule OpenrelikWorkerStrings.Application do
 
         [
           {Task.Supervisor, name: OpenrelikWorkerStrings.TaskSupervisor},
-          Src.App.worker_child_spec(
+          OpenrelikWorkerStrings.CeleryApp.worker_child_spec(
             concurrency: concurrency,
             queues: queues,
             shutdown: shutdown_timeout

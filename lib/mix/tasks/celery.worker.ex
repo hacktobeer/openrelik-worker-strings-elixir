@@ -9,14 +9,14 @@ defmodule Mix.Tasks.Celery.Worker do
 
       # Standard OpenRelik docker-compose invocation:
       REDIS_URL=redis://localhost:6379/0 mix celery.worker \\
-        --app=src.tasks worker --task-events --concurrency=4 --loglevel=INFO -Q openrelik-worker-strings
+        --app=OpenrelikWorkerStrings.Tasks worker --task-events --concurrency=4 --loglevel=INFO -Q openrelik-worker-strings
 
       # Short flags with custom 60-second graceful shutdown timeout:
       REDIS_URL=redis://localhost:6379/0 mix celery.worker -c 4 -l info -Q openrelik-worker-strings --shutdown-timeout=60000
 
   ## Supported Options
 
-  - `--app`, `-A` - Task module to load (default: `"src.tasks"`).
+  - `--app`, `-A` - Task module to load (default: `"OpenrelikWorkerStrings.Tasks"`).
   - `--concurrency`, `-c` - Number of concurrent task worker processes (default: `1`).
   - `--queues`, `-Q` - Comma-separated list of queues to consume from (always includes `"openrelik-worker-strings"`).
   - `--loglevel`, `-l` - Logger level (`debug`, `info`, `warning`, `error`; default: `info`).
@@ -64,18 +64,17 @@ defmodule Mix.Tasks.Celery.Worker do
     OpenrelikWorkerStrings.Config.put_cli_worker_mode(true)
     Mix.Task.run("app.start")
 
-    if app_mod = Keyword.get(opts, :app) do
-      Celery.Registry.load_include(app_mod)
-    end
+    app_mod = Keyword.get(opts, :app, OpenrelikWorkerStrings.Tasks)
+    Celery.Registry.load_include(app_mod)
 
     concurrency = Keyword.get(opts, :concurrency, 1)
-    queues = Src.App.resolve_queues(Keyword.get(opts, :queues))
+    queues = OpenrelikWorkerStrings.CeleryApp.resolve_queues(Keyword.get(opts, :queues))
     send_events = Keyword.get(opts, :task_events, true)
 
     shutdown_timeout =
       case Keyword.get(opts, :shutdown_timeout) do
-        nil -> Src.App.shutdown_timeout_ms()
-        raw -> Src.App.parse_shutdown_timeout(raw)
+        nil -> OpenrelikWorkerStrings.CeleryApp.shutdown_timeout_ms()
+        raw -> OpenrelikWorkerStrings.CeleryApp.parse_shutdown_timeout(raw)
       end
 
     app_opts =
@@ -83,7 +82,7 @@ defmodule Mix.Tasks.Celery.Worker do
       |> maybe_put(:broker, Keyword.get(opts, :broker))
       |> maybe_put(:backend, Keyword.get(opts, :backend))
 
-    app = Src.App.celery(app_opts)
+    app = OpenrelikWorkerStrings.CeleryApp.celery(app_opts)
 
     worker_opts =
       [
@@ -95,7 +94,7 @@ defmodule Mix.Tasks.Celery.Worker do
       ]
       |> maybe_put(:hostname, Keyword.get(opts, :hostname))
 
-    child_spec = Src.App.worker_child_spec(worker_opts)
+    child_spec = OpenrelikWorkerStrings.CeleryApp.worker_child_spec(worker_opts)
 
     Logger.info(
       "Starting openrelik-worker-strings Celery worker " <>

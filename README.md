@@ -13,7 +13,7 @@ This repository serves two purposes:
 ```mermaid
 flowchart LR
     UI["OpenRelik UI / Server"] -- "1. inspect.registered (Pidbox)\n2. Dispatch task to queue" --> Redis[("Redis Broker & Backend")]
-    Redis -- "3. Consume task from\nopenrelik-worker-strings" --> Worker["Elixir Celery.Worker\n(Src.Tasks.strings)"]
+    Redis -- "3. Consume task from\nopenrelik-worker-strings" --> Worker["Elixir Celery.Worker\n(OpenrelikWorkerStrings.Tasks.strings)"]
     Worker -- "4. Write output files" --> Volume[("Shared Artifact Volume\n/usr/share/openrelik/data")]
     Worker -- "5. Publish task-* events\n(/0.celeryev/*)" --> Redis
     Worker -- "6. Save Base64 JSON result\n(celery-task-meta-*)" --> Redis
@@ -24,11 +24,11 @@ An OpenRelik worker interacts with the core platform through five mechanisms, al
 
 | Mechanism | OpenRelik Expectation | Elixir Implementation |
 | :--- | :--- | :--- |
-| **Task Discovery & UI Schema** | `openrelik-server` broadcasts `inspect.registered` over `celery.pidbox` and parses `metadata={...}` from each registered task entry to build the workflow UI. | `@task bind: true, name: @task_name, metadata: @task_metadata` in [`lib/src/tasks.ex`](lib/src/tasks.ex) |
-| **Queue Routing** | `openrelik-server` routes tasks to the queue matching the prefix of the task name (`task_name.split(".")[0]`). | Task `"openrelik-worker-strings.tasks.strings"` consumes from queue `"openrelik-worker-strings"` in [`lib/src/app.ex`](lib/src/app.ex) |
+| **Task Discovery & UI Schema** | `openrelik-server` broadcasts `inspect.registered` over `celery.pidbox` and parses `metadata={...}` from each registered task entry to build the workflow UI. | `@task bind: true, name: @task_name, metadata: @task_metadata` in [`lib/openrelik_worker_strings/tasks.ex`](lib/openrelik_worker_strings/tasks.ex) |
+| **Queue Routing** | `openrelik-server` routes tasks to the queue matching the prefix of the task name (`task_name.split(".")[0]`). | Task `"openrelik-worker-strings.tasks.strings"` consumes from queue `"openrelik-worker-strings"` in [`lib/openrelik_worker_strings/celery_app.ex`](lib/openrelik_worker_strings/celery_app.ex) |
 | **Chained Workflow Inputs** | First task in a workflow receives `input_files`; downstream chained tasks receive `pipe_result` (Base64-encoded JSON from the upstream task). | `OpenrelikWorkerCommon.TaskUtils.get_input_files/3` from [`openrelik_worker_common`](https://hex.pm/packages/openrelik_worker_common) |
 | **Artifact Output Files** | Output files must be written to `output_path` with a `<uuid><extension>` filename while retaining their human-readable `display_name`. | `OpenrelikWorkerCommon.FileUtils.create_output_file/2` from [`openrelik_worker_common`](https://hex.pm/packages/openrelik_worker_common) |
-| **Real-Time Events & Results** | `openrelik-mediator` and Flower listen to `/0.celeryev/*` (Redis fanout Pub/Sub) for `task-received`, `task-started`, `task-progress`, and `task-succeeded`, then decode the Base64 JSON result from `celery-task-meta-<uuid>`. | `Src.Tasks.send_event/3` and `OpenrelikWorkerCommon.TaskUtils.create_task_result/1` |
+| **Real-Time Events & Results** | `openrelik-mediator` and Flower listen to `/0.celeryev/*` (Redis fanout Pub/Sub) for `task-received`, `task-started`, `task-progress`, and `task-succeeded`, then decode the Base64 JSON result from `celery-task-meta-<uuid>`. | `OpenrelikWorkerStrings.Events.send_event/3` and `OpenrelikWorkerCommon.TaskUtils.create_task_result/1` |
 
 ---
 
@@ -44,15 +44,15 @@ An OpenRelik worker interacts with the core platform through five mechanisms, al
 │   ├── openrelik_worker_strings.ex               # Top-level public API delegates
 │   ├── openrelik_worker_strings/
 │   │   ├── application.ex                        # OTP Application supervisor, task registration & supervised worker startup
-│   │   └── config.ex                             # Centralized environment variable & application config resolution
-│   ├── src/
-│   │   ├── app.ex                                # Celery app & worker configuration (REDIS_URL, default queue)
+│   │   ├── celery_app.ex                         # Celery app & worker configuration (REDIS_URL, default queue)
+│   │   ├── config.ex                             # Centralized environment variable & application config resolution
 │   │   ├── events.ex                             # Celery event emission (`send_event/3`, `celeryev` publishing)
 │   │   └── tasks.ex                              # `strings` Celery task, UI metadata, bounded-concurrency subprocess execution
 │   └── mix/tasks/
 │       └── celery.worker.ex                      # `mix celery.worker` CLI task compatible with Python Celery flags
 └── test/
-    └── src/tasks_test.exs                        # End-to-end task & worker tests using a portable `strings` shim
+    └── openrelik_worker_strings/
+        └── tasks_test.exs                        # End-to-end task & worker tests using a portable `strings` shim
 ```
 
 ---
@@ -133,7 +133,7 @@ mix compile
 
 ```bash
 REDIS_URL=redis://localhost:6379/0 mix celery.worker \
-  --app=src.tasks \
+  --app=OpenrelikWorkerStrings.Tasks \
   --task-events \
   --concurrency=4 \
   --loglevel=INFO \
@@ -144,7 +144,7 @@ REDIS_URL=redis://localhost:6379/0 mix celery.worker \
 
 | Flag | Alias | Default | Description |
 | :--- | :---: | :--- | :--- |
-| `--app` | `-A` | `"src.tasks"` | Task module to load into `Celery.Registry` |
+| `--app` | `-A` | `"OpenrelikWorkerStrings.Tasks"` | Task module to load into `Celery.Registry` |
 | `--concurrency` | `-c` | `1` | Maximum concurrent task processes |
 | `--queues` | `-Q` | `"openrelik-worker-strings"` | Comma-separated queue names to consume from |
 | `--loglevel` | `-l` | `"info"` | Elixir Logger level (`debug`, `info`, `warning`, `error`) |
@@ -232,10 +232,10 @@ defp deps do
 end
 ```
 
-### Step 2: Define the Task Module (`lib/src/tasks.ex`)
+### Step 2: Define the Task Module (`lib/openrelik_worker_strings/tasks.ex`)
 
 ```elixir
-defmodule Src.Tasks do
+defmodule OpenrelikWorkerStrings.Tasks do
   use Celery.Task
   require Logger
 
@@ -303,8 +303,8 @@ end
 
 ### Step 3: Register the Task Module on Application Startup (`lib/my_worker/application.ex`)
 
-Always call `Celery.Registry.load_include(Src.Tasks)` inside your `Application.start/2` callback so the task definition and its `@task_metadata` are registered before any worker process starts:
+Always call `Celery.Registry.load_include(OpenrelikWorkerStrings.Tasks)` inside your `Application.start/2` callback so the task definition and its `@task_metadata` are registered before any worker process starts:
 
 ```elixir
-Celery.Registry.load_include(Src.Tasks)
+Celery.Registry.load_include(OpenrelikWorkerStrings.Tasks)
 ```
