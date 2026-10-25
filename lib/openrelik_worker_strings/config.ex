@@ -142,13 +142,36 @@ defmodule OpenrelikWorkerStrings.Config do
         n
 
       _ ->
-        Logger.warning("Invalid WORKER_CONCURRENCY=#{inspect(value)}; falling back to 1")
+        Logger.warning("Invalid concurrency=#{inspect(value)}; falling back to 1")
 
         1
     end
   end
 
   def parse_worker_concurrency(_), do: 1
+
+  # --- Extraction Parallelism (`EXTRACTION_CONCURRENCY`) ---
+
+  @doc """
+  Resolves the maximum number of `strings(1)` subprocesses spawned concurrently
+  within a single task execution from the `EXTRACTION_CONCURRENCY` environment
+  variable (or `:extraction_concurrency` application config), defaulting to
+  `1` — the serial behavior of the Python `openrelik-worker-strings` Celery
+  task.
+
+  Extraction is parallelized across all (encoding × input file) pairs via
+  `Task.async_stream` with bounded concurrency; Celery task processes already
+  parallelize across task executions (`WORKER_CONCURRENCY`), so the total
+  number of subprocesses per worker node is bounded by
+  `WORKER_CONCURRENCY × extraction_concurrency/0`.
+  """
+  @spec extraction_concurrency() :: pos_integer()
+  def extraction_concurrency do
+    case System.get_env("EXTRACTION_CONCURRENCY") do
+      nil -> parse_worker_concurrency(app_env(:extraction_concurrency, 1))
+      raw -> parse_worker_concurrency(raw)
+    end
+  end
 
   @doc """
   Resolves additional queue names to consume from from the

@@ -52,6 +52,7 @@ defmodule OpenrelikWorkerStrings.Application do
         )
 
         [
+          {Task.Supervisor, name: OpenrelikWorkerStrings.TaskSupervisor},
           Src.App.worker_child_spec(
             concurrency: concurrency,
             queues: queues,
@@ -63,7 +64,7 @@ defmodule OpenrelikWorkerStrings.Application do
           "Supervised Celery.Worker not enabled (using `mix celery.worker` CLI or START_WORKER is unset)"
         )
 
-        []
+        [{Task.Supervisor, name: OpenrelikWorkerStrings.TaskSupervisor}]
       end
 
     opts = [strategy: :one_for_one, name: OpenrelikWorkerStrings.Supervisor]

@@ -182,14 +182,7 @@ defmodule Src.Tasks do
     # Run extraction for the selected encodings (or default ASCII with `.strings` naming
     # if no encoding options were selected in the UI), and only register output files
     # where `strings` extracted data (`size > 0`).
-    output_files =
-      for {encoding_name, encoding_flag} <- config_entries,
-          input_file <- resolved_input_files,
-          output_file =
-            extract_strings_for_file(self, input_file, output_path, encoding_name, encoding_flag),
-          not is_nil(output_file) do
-        output_file
-      end
+    output_files = run_extractions(self, resolved_input_files, output_path, config_entries)
 
     if output_files == [] do
       Logger.info(
@@ -211,6 +204,75 @@ defmodule Src.Tasks do
   end
 
   # --- Internal Helpers ---
+
+  # Runs extraction for all (encoding, input file) pairs via
+  # `Task.Supervisor.async_stream_nolink` with bounded concurrency
+  # (`Config.extraction_concurrency/0`, default `1` for parity with the serial
+  # Python worker), keeping `"task-progress"` events tagged per output file.
+  # Results are collected in deterministic job order, and a failing extraction
+  # (non-zero `strings` exit status or runner crash) re-raises in the task
+  # process after the stream completes, aborting the task so no partial
+  # outputs are registered.
+  defp run_extractions(self_task, input_files, output_path, config_entries) do
+    jobs =
+      for {encoding_name, encoding_flag} <- config_entries,
+          input_file <- input_files do
+        {input_file, encoding_name, encoding_flag}
+      end
+
+    max_concurrency = min(Config.extraction_concurrency(), length(jobs))
+
+    Logger.debug(
+      "Running #{length(jobs)} strings extraction job(s) " <>
+        "(max_concurrency=#{max_concurrency})"
+    )
+
+    results =
+      Task.Supervisor.async_stream_nolink(
+        OpenrelikWorkerStrings.TaskSupervisor,
+        jobs,
+        fn {input_file, encoding_name, encoding_flag} ->
+          extract_strings_for_file(
+            self_task,
+            input_file,
+            output_path,
+            encoding_name,
+            encoding_flag
+          )
+        end,
+        max_concurrency: max_concurrency,
+        ordered: true,
+        timeout: :infinity
+      )
+
+    Enum.flat_map(results, &collect_extraction_result/1)
+  end
+
+  # Flattens one bounded-concurrency stream result: skips `nil` (no strings
+  # extracted / skipped), keeps successful serialized output file maps, and
+  # re-raises extraction worker crashes in the task process so the task fails
+  # (matching the serial failure semantics of the pre-parallel implementation).
+  defp collect_extraction_result({ok_result, nil}) when ok_result in [:ok, :exit] do
+    []
+  end
+
+  defp collect_extraction_result({:ok, output_file}) do
+    [output_file]
+  end
+
+  defp collect_extraction_result({:exit, {exception, stacktrace}})
+       when is_exception(exception) and is_list(stacktrace) do
+    reraise exception, stacktrace
+  end
+
+  defp collect_extraction_result({:exit, {reason, stacktrace}}) when is_list(stacktrace) do
+    raise RuntimeError,
+          "strings extraction worker exited unexpectedly: #{inspect({reason, stacktrace})}"
+  end
+
+  defp collect_extraction_result({:exit, reason}) do
+    raise RuntimeError, "strings extraction worker exited unexpectedly: #{inspect(reason)}"
+  end
 
   # Runs GNU `strings` for a single input file + encoding and returns its serialized
   # `OutputFile.to_dict/1` map.
@@ -252,7 +314,12 @@ defmodule Src.Tasks do
         "command=#{inspect(Enum.join(command, " "))})"
     )
 
-    run_command_with_progress(self_task, command, output_file.path)
+    run_command_with_progress(
+      self_task,
+      command,
+      output_file.path,
+      progress_fields(display_name, encoding_label)
+    )
 
     case File.stat(output_file.path) do
       {:ok, %File.Stat{size: size}} when size > 0 ->
@@ -279,12 +346,19 @@ defmodule Src.Tasks do
 
   # Spawns the external `strings` executable, streams its standard output directly to
   # `output_file_path` (creating the file on disk only when output bytes are produced),
-  # and periodically emits `"task-progress"` events until the command exits.
+  # and periodically emits `"task-progress"` events until the command exits. Events
+  # are tagged with `progress_fields` (input file display name and encoding label)
+  # so progress is unambiguous when extractions run in parallel.
   #
   # Raises `RuntimeError` when the `strings` subprocess exits with a non-zero status
   # or when the runner process crashes, so partially written output is never
   # registered as a successful artifact.
-  defp run_command_with_progress(self_task, [executable | args], output_file_path) do
+  defp run_command_with_progress(
+         self_task,
+         [executable | args],
+         output_file_path,
+         progress_fields
+       ) do
     output_file_path |> Path.dirname() |> File.mkdir_p!()
 
     exec_path =
@@ -311,7 +385,7 @@ defmodule Src.Tasks do
     start_time_us = System.monotonic_time(:microsecond)
     update_interval_ms = Config.update_interval_ms()
 
-    emit_progress(self_task, runner_pid, output_file_path, start_time_us)
+    emit_progress(self_task, runner_pid, output_file_path, start_time_us, progress_fields)
 
     await_command_completion(
       self_task,
@@ -319,7 +393,8 @@ defmodule Src.Tasks do
       mon_ref,
       output_file_path,
       start_time_us,
-      update_interval_ms
+      update_interval_ms,
+      progress_fields
     )
   end
 
@@ -396,7 +471,8 @@ defmodule Src.Tasks do
          mon_ref,
          output_file_path,
          start_time_us,
-         update_interval_ms
+         update_interval_ms,
+         progress_fields
        ) do
     receive do
       {^runner_pid, {:strings_exited, {:ok, _line_count}}} ->
@@ -431,7 +507,7 @@ defmodule Src.Tasks do
                 "(#{format_exit_reason(reason)}; output=#{output_file_path})"
     after
       update_interval_ms ->
-        emit_progress(self_task, runner_pid, output_file_path, start_time_us)
+        emit_progress(self_task, runner_pid, output_file_path, start_time_us, progress_fields)
 
         await_command_completion(
           self_task,
@@ -439,7 +515,8 @@ defmodule Src.Tasks do
           mon_ref,
           output_file_path,
           start_time_us,
-          update_interval_ms
+          update_interval_ms,
+          progress_fields
         )
     end
   end
@@ -492,8 +569,10 @@ defmodule Src.Tasks do
   defp format_exit_reason(reason), do: inspect(reason)
 
   # Emits a `"task-progress"` event reporting the incremental line count tracked
-  # by the running subprocess (no full file re-read) and the extraction rate.
-  defp emit_progress(self_task, runner_pid, output_file_path, start_time_us) do
+  # by the running subprocess (no full file re-read), the extraction rate, and
+  # the `progress_fields` (input file display name and encoding label) that
+  # identify this extraction when several run in parallel.
+  defp emit_progress(self_task, runner_pid, output_file_path, start_time_us, progress_fields) do
     extracted_strings = get_line_count(runner_pid)
 
     duration_s = (System.monotonic_time(:microsecond) - start_time_us) / 1_000_000.0
@@ -512,8 +591,16 @@ defmodule Src.Tasks do
     Events.send_event(
       self_task,
       "task-progress",
-      data: %{"extracted_strings" => extracted_strings, "rate" => rate}
+      data:
+        Map.merge(progress_fields, %{
+          "extracted_strings" => extracted_strings,
+          "rate" => rate
+        })
     )
+  end
+
+  defp progress_fields(display_name, encoding_label) do
+    %{"file" => display_name, "encoding" => encoding_label}
   end
 
   # Requests the current incremental line count from the runner process.

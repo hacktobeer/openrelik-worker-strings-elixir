@@ -84,6 +84,15 @@ defmodule Src.TasksTest do
   } do
     System.put_env("STRINGS_SHIM_SLEEP", "0.05")
 
+    # Run both (encoding × input file) extraction jobs in parallel so the
+    # bounded-concurrency `Task.async_stream` path is exercised. Progress
+    # events are tagged per output file to stay unambiguous under parallelism.
+    Application.put_env(:openrelik_worker_strings, :extraction_concurrency, 2)
+
+    on_exit(fn ->
+      Application.delete_env(:openrelik_worker_strings, :extraction_concurrency)
+    end)
+
     input_path = Path.join(tmp_dir, "sample.bin")
     File.write!(input_path, "hello world\n")
 
@@ -135,7 +144,12 @@ defmodule Src.TasksTest do
     assert_receive {:celery_event, "task-progress",
                     %{
                       "type" => "task-progress",
-                      "data" => %{"extracted_strings" => _, "rate" => _}
+                      "data" => %{
+                        "extracted_strings" => _,
+                        "rate" => _,
+                        "file" => "sample.bin",
+                        "encoding" => _
+                      }
                     }}
   end
 

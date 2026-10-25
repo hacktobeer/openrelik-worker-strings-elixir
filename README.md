@@ -36,15 +36,19 @@ An OpenRelik worker interacts with the core platform through five mechanisms, al
 
 ```text
 .
-├── Dockerfile                                    # Production container image (Elixir 1.20 / OTP 29 + binutils)
+├── Dockerfile                                    # Multi-stage build: mix release + runtime image (Elixir 1.20 / OTP 29 + binutils)
 ├── mix.exs                                       # Mix project definition and dependencies (:celery, :openrelik_worker_common)
+├── rel/
+│   └── env.sh.eex                                # Release runtime env hooks (Erlang distribution for the `rpc` healthcheck)
 ├── lib/
 │   ├── openrelik_worker_strings.ex               # Top-level public API delegates
 │   ├── openrelik_worker_strings/
-│   │   └── application.ex                        # OTP Application supervisor & task registration on startup
+│   │   ├── application.ex                        # OTP Application supervisor, task registration & supervised worker startup
+│   │   └── config.ex                             # Centralized environment variable & application config resolution
 │   ├── src/
 │   │   ├── app.ex                                # Celery app & worker configuration (REDIS_URL, default queue)
-│   │   └── tasks.ex                              # `strings` Celery task, UI metadata, subprocess & progress loop
+│   │   ├── events.ex                             # Celery event emission (`send_event/3`, `celeryev` publishing)
+│   │   └── tasks.ex                              # `strings` Celery task, UI metadata, bounded-concurrency subprocess execution
 │   └── mix/tasks/
 │       └── celery.worker.ex                      # `mix celery.worker` CLI task compatible with Python Celery flags
 └── test/
@@ -72,19 +76,26 @@ Add the service definition to your OpenRelik `docker-compose.yml` file:
     container_name: openrelik-worker-strings-elixir
     image: openrelik-worker-strings-elixir:latest
     restart: always
+    # Must exceed WORKER_SHUTDOWN_TIMEOUT_MS (Docker SIGKILLs the container after this grace period).
     stop_grace_period: 35s
     environment:
       - REDIS_URL=redis://openrelik-redis:6379/0
       - WORKER_SHUTDOWN_TIMEOUT_MS=30000
+      - WORKER_CONCURRENCY=1
+      - EXTRACTION_CONCURRENCY=1
     volumes:
+      # The container runs as a non-root user (uid/gid 10001); make sure the
+      # host directory is writable by that user, or add `user: "<uid>:<gid>"`
+      # to match the host directory ownership.
       - ./data:/usr/share/openrelik/data
     depends_on:
       - openrelik-redis
-    command: "mix celery.worker --app=src.tasks worker --task-events --concurrency=4 --loglevel=INFO -Q openrelik-worker-strings"
+    # Default CMD (`bin/openrelik_worker_strings start`) launches the OTP release
+    # and the supervised Celery worker. Override only if you need custom flags.
 ```
 
 > [!IMPORTANT]
-> **Queue Name Requirement**: OpenRelik Server routes tasks to the queue matching the first segment of the task name (`"openrelik-worker-strings.tasks.strings"` $\rightarrow$ `"openrelik-worker-strings"`). Always ensure `"openrelik-worker-strings"` is included in `-Q` (or omit `-Q` to use the default queue).
+> **Queue Name Requirement**: OpenRelik Server routes tasks to the queue matching the first segment of the task name (`"openrelik-worker-strings.tasks.strings"` $\rightarrow$ `"openrelik-worker-strings"`). The release starts a supervised `Celery.Worker` consuming from `"openrelik-worker-strings"` by default; adjust `WORKER_QUEUES` if you renamed the queue.
 > Also ensure only one strings worker container (either the Python worker or this Elixir worker) is active at a time if both register the same task name.
 
 ### 3. Start the Worker Container
@@ -163,9 +174,24 @@ mix run --no-halt
 | :--- | :--- | :--- |
 | `REDIS_URL` | `"redis://localhost:6379/0"` | Redis URL used for both the Celery message broker and result backend. |
 | `WORKER_SHUTDOWN_TIMEOUT_MS` | `"30000"` (`30` seconds) | Time in milliseconds (or `"infinity"`) that `OpenrelikWorkerStrings.Supervisor` waits for `Celery.Worker` to shut down gracefully before forcibly killing it. |
-| `START_WORKER` | `"false"` | When `"true"` (or `"1"`), starts `Celery.Worker` automatically under `OpenrelikWorkerStrings.Supervisor` when running via `mix run --no-halt` or an OTP release. |
-| `WORKER_CONCURRENCY` | `"1"` | Number of concurrent task processes when running via `START_WORKER=true`. |
+| `START_WORKER` | `"false"` (`"true"` in the release image) | When `"true"` (or `"1"`), starts `Celery.Worker` automatically under `OpenrelikWorkerStrings.Supervisor` when running via `mix run --no-halt` or the OTP release. |
+| `WORKER_CONCURRENCY` | `"1"` | Number of concurrent Celery task processes when running via `START_WORKER=true`. |
+| `EXTRACTION_CONCURRENCY` | `"1"` | Max concurrent `strings(1)` subprocesses spawned within a single task execution (bounded parallelism across input files × encodings; total subprocesses per node = `WORKER_CONCURRENCY × EXTRACTION_CONCURRENCY`). |
 | `WORKER_QUEUES` | `"openrelik-worker-strings"` | Comma-separated queue names when running via `START_WORKER=true`. |
+
+### Task execution parallelism (`EXTRACTION_CONCURRENCY`)
+
+A task execution extracts strings for every (encoding × input file) pair. By
+default these runs are serialized (`EXTRACTION_CONCURRENCY=1`), matching the
+Python `openrelik-worker-strings` behavior. Setting
+`EXTRACTION_CONCURRENCY` (or the `:extraction_concurrency` application config)
+to a higher value runs up to that many `strings(1)` subprocesses concurrently
+via `Task.Supervisor.async_stream_nolink` — each job still reports its own
+`"task-progress"` events tagged with `file` and `encoding`, and any failing
+extraction (non-zero exit status, unexpected termination) still fails the
+whole task like the serial implementation. Since `strings(1)` is CPU-bound
+during scan phases and I/O-bound when writing, tune the value to your disk
+and CPU profile; results are collected in deterministic order regardless.
 
 ### How `WORKER_SHUTDOWN_TIMEOUT_MS` Works & Its Impact
 
