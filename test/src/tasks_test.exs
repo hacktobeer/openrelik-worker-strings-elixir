@@ -27,6 +27,7 @@ defmodule Src.TasksTest do
     fi
     echo "0 extracted_${ENC}_line_1 from $(basename "$FILE")"
     echo "16 extracted_${ENC}_line_2 from $(basename "$FILE")"
+    exit "${STRINGS_SHIM_EXIT:-0}"
     """
 
     File.write!(shim_path, shim_script)
@@ -42,6 +43,7 @@ defmodule Src.TasksTest do
       Application.delete_env(:openrelik_worker_strings, :event_handler)
       System.delete_env("STRINGS_SHIM_SLEEP")
       System.delete_env("STRINGS_SHIM_EMPTY_ENC")
+      System.delete_env("STRINGS_SHIM_EXIT")
     end)
 
     :ok
@@ -303,6 +305,34 @@ defmodule Src.TasksTest do
     assert decoded_empty["output_files"] == []
     assert decoded_empty["workflow_id"] == "wf-empty-2"
     assert File.ls!(empty_out_dir) == []
+  end
+
+  @tag :tmp_dir
+  test "strings task raises RuntimeError and removes partial output when the subprocess exits non-zero",
+       %{tmp_dir: tmp_dir} do
+    System.put_env("STRINGS_SHIM_EXIT", "3")
+
+    input_path = Path.join(tmp_dir, "failing.bin")
+    File.write!(input_path, "partially extractable data\n")
+
+    output_dir = Path.join(tmp_dir, "out_fail")
+    File.mkdir_p!(output_dir)
+
+    app = App.celery(task_always_eager: true, task_eager_propagates: true)
+
+    assert_raise RuntimeError, ~r/exited with non-zero status 3/, fn ->
+      Celery.send_task(app, Tasks.task_name(),
+        kwargs: %{
+          "input_files" => [%{"display_name" => "failing.bin", "path" => input_path}],
+          "output_path" => output_dir,
+          "workflow_id" => "wf-fail",
+          "task_config" => %{"ASCII" => true}
+        }
+      )
+    end
+
+    # The truncated output file written before the failure must have been removed.
+    assert File.ls!(output_dir) == []
   end
 
   @tag :tmp_dir

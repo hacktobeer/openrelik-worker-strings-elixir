@@ -324,6 +324,10 @@ defmodule Src.Tasks do
   # Spawns the external `strings` executable, streams its standard output directly to
   # `output_file_path` (creating the file on disk only when output bytes are produced),
   # and periodically emits `"task-progress"` events until the command exits.
+  #
+  # Raises `RuntimeError` when the `strings` subprocess exits with a non-zero status
+  # or when the runner process crashes, so partially written output is never
+  # registered as a successful artifact.
   defp run_command_with_progress(self_task, [executable | args], output_file_path) do
     output_file_path |> Path.dirname() |> File.mkdir_p!()
 
@@ -341,15 +345,19 @@ defmodule Src.Tasks do
       "Spawning strings subprocess: #{exec_path} #{Enum.join(args, " ")} -> #{output_file_path}"
     )
 
+    parent = self()
+
     {runner_pid, mon_ref} =
       spawn_monitor(fn ->
-        stream_port_to_file(exec_path, args, output_file_path)
+        stream_port_to_file(parent, exec_path, args, output_file_path)
       end)
 
     start_time_us = System.monotonic_time(:microsecond)
     update_interval_ms = update_interval_ms()
 
-    poll_until_finished(
+    emit_progress(self_task, runner_pid, output_file_path, start_time_us)
+
+    await_command_completion(
       self_task,
       runner_pid,
       mon_ref,
@@ -359,46 +367,74 @@ defmodule Src.Tasks do
     )
   end
 
-  defp stream_port_to_file(exec_path, args, output_file_path) do
+  # Runner process entry point: opens the port, streams its data to
+  # `output_file_path` while counting lines incrementally, and reports the
+  # final `{:strings_exited, {:ok, line_count} | {:error, reason}}` result to
+  # `parent` before exiting cleanly.
+  defp stream_port_to_file(parent, exec_path, args, output_file_path) do
     port =
       Port.open(
         {:spawn_executable, exec_path},
         [:binary, :exit_status, {:args, args}]
       )
 
-    collect_port_output(port, nil, output_file_path)
+    {exit_status, line_count} = collect_port_output(port, parent, nil, output_file_path, 0)
+
+    result =
+      if exit_status == 0 do
+        {:ok, line_count}
+      else
+        {:error, {:exit_status, exit_status}}
+      end
+
+    Logger.debug(
+      "Strings subprocess exited with status #{exit_status} and #{line_count} line(s) " <>
+        "(output=#{output_file_path})"
+    )
+
+    send(parent, {self(), {:strings_exited, result}})
   end
 
-  defp collect_port_output(port, file, output_file_path) do
+  # Streams port data to `output_file_path`, counting newline occurrences
+  # incrementally (matching `wc -l` semantics used by
+  # `FileUtils.count_file_lines/1`) so progress events do not need to re-read the
+  # output file, and answers `{:get_counts, reply_ref}` requests from the
+  # polling (task) process with the current line count.
+  defp collect_port_output(port, parent, file, output_file_path, line_count) do
     receive do
       {^port, {:data, ""}} ->
-        collect_port_output(port, file, output_file_path)
+        collect_port_output(port, parent, file, output_file_path, line_count)
 
       {^port, {:data, chunk}} ->
         file = file || File.open!(output_file_path, [:write, :binary])
         IO.binwrite(file, chunk)
-        collect_port_output(port, file, output_file_path)
 
-      {^port, {:exit_status, 0}} ->
-        if file, do: File.close(file)
-        Logger.debug("Strings subprocess exited with status 0 (output=#{output_file_path})")
-        :ok
+        collect_port_output(
+          port,
+          parent,
+          file,
+          output_file_path,
+          line_count + count_newlines(chunk)
+        )
 
       {^port, {:exit_status, status}} ->
         if file, do: File.close(file)
+        {status, line_count}
 
-        Logger.warning(
-          "Strings subprocess exited with non-zero status #{status} (output=#{output_file_path})"
-        )
-
-        :ok
+      {^parent, {:get_counts, reply_ref}} ->
+        send(parent, {reply_ref, line_count})
+        collect_port_output(port, parent, file, output_file_path, line_count)
     end
   end
 
-  # Emits `"task-progress"` events every `update_interval_ms` while the subprocess is
-  # alive, waking up immediately when the monitored subprocess exits (`{:DOWN, ...}`)
-  # instead of blocking for the remainder of the sleep interval.
-  defp poll_until_finished(
+  defp count_newlines(chunk) when is_binary(chunk) do
+    byte_size(chunk) - byte_size(:binary.replace(chunk, "\n", "", [:global]))
+  end
+
+  # Awaits the completion of the monitored subprocess runner while emitting
+  # `"task-progress"` events every `update_interval_ms`, waking up immediately
+  # when the runner reports completion or exits (`{:DOWN, ...}`).
+  defp await_command_completion(
          self_task,
          runner_pid,
          mon_ref,
@@ -407,36 +443,102 @@ defmodule Src.Tasks do
          update_interval_ms
        ) do
     receive do
-      {:DOWN, ^mon_ref, :process, ^runner_pid, _reason} ->
-        :ok
-    after
-      0 ->
-        emit_progress(self_task, output_file_path, start_time_us)
+      {^runner_pid, {:strings_exited, {:ok, _line_count}}} ->
+        ensure_runner_down(mon_ref, runner_pid)
 
+      {^runner_pid, {:strings_exited, {:error, reason}}} ->
+        ensure_runner_down(mon_ref, runner_pid)
+        cleanup_partial_output(output_file_path)
+
+        raise RuntimeError, strings_failure_message(reason, output_file_path)
+
+      {:DOWN, ^mon_ref, :process, ^runner_pid, :normal} ->
+        # Safeguard in case the runner exits before its result message is
+        # observed; peek briefly for a queued result before assuming success.
         receive do
-          {:DOWN, ^mon_ref, :process, ^runner_pid, _reason} ->
+          {^runner_pid, {:strings_exited, {:ok, _line_count}}} ->
             :ok
+
+          {^runner_pid, {:strings_exited, {:error, reason}}} ->
+            cleanup_partial_output(output_file_path)
+            raise RuntimeError, strings_failure_message(reason, output_file_path)
         after
-          update_interval_ms ->
-            poll_until_finished(
-              self_task,
-              runner_pid,
-              mon_ref,
-              output_file_path,
-              start_time_us,
-              update_interval_ms
-            )
+          5_000 ->
+            :ok
         end
+
+      {:DOWN, ^mon_ref, :process, ^runner_pid, reason} ->
+        cleanup_partial_output(output_file_path)
+
+        raise RuntimeError,
+              "strings runner process exited unexpectedly " <>
+                "(#{format_exit_reason(reason)}; output=#{output_file_path})"
+    after
+      update_interval_ms ->
+        emit_progress(self_task, runner_pid, output_file_path, start_time_us)
+
+        await_command_completion(
+          self_task,
+          runner_pid,
+          mon_ref,
+          output_file_path,
+          start_time_us,
+          update_interval_ms
+        )
     end
   end
 
-  defp emit_progress(self_task, output_file_path, start_time_us) do
-    extracted_strings =
-      if File.exists?(output_file_path) do
-        FileUtils.count_file_lines(output_file_path)
-      else
-        0
-      end
+  # Waits for the monitored runner process to terminate after it reported its
+  # final result, so no stale `{:DOWN, ...}` message is left in the caller's
+  # mailbox.
+  defp ensure_runner_down(mon_ref, runner_pid) do
+    receive do
+      {:DOWN, ^mon_ref, :process, ^runner_pid, _reason} ->
+        :ok
+    after
+      5_000 ->
+        :ok
+    end
+  end
+
+  # Deletes a truncated output file produced by a failed `strings` subprocess so
+  # partial data is never left on disk or registered downstream.
+  defp cleanup_partial_output(output_file_path) do
+    case File.rm(output_file_path) do
+      :ok ->
+        Logger.info(
+          "Removed partial strings output file after subprocess failure: #{output_file_path}"
+        )
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to remove partial strings output file #{output_file_path}: #{inspect(reason)}"
+        )
+
+        :ok
+    end
+  end
+
+  defp strings_failure_message({:exit_status, status}, output_file_path) do
+    "strings command exited with non-zero status #{status} (output=#{output_file_path})"
+  end
+
+  defp format_exit_reason({exception, stacktrace})
+       when is_exception(exception) and is_list(stacktrace) do
+    Exception.format_banner(:error, exception, stacktrace)
+  rescue
+    _ -> inspect({exception, stacktrace})
+  end
+
+  defp format_exit_reason(reason), do: inspect(reason)
+
+  # Emits a `"task-progress"` event reporting the incremental line count tracked
+  # by the running subprocess (no full file re-read) and the extraction rate.
+  defp emit_progress(self_task, runner_pid, output_file_path, start_time_us) do
+    extracted_strings = get_line_count(runner_pid)
 
     duration_s = (System.monotonic_time(:microsecond) - start_time_us) / 1_000_000.0
 
@@ -456,6 +558,23 @@ defmodule Src.Tasks do
       "task-progress",
       data: %{"extracted_strings" => extracted_strings, "rate" => rate}
     )
+  end
+
+  # Requests the current incremental line count from the runner process.
+  # Falls back to `0` (with a debug log) when the runner is already gone —
+  # completion is handled via the `{:DOWN, ...}`/result messages instead.
+  defp get_line_count(runner_pid) do
+    reply_ref = make_ref()
+    send(runner_pid, {self(), {:get_counts, reply_ref}})
+
+    receive do
+      {^reply_ref, count} when is_integer(count) ->
+        count
+    after
+      1_000 ->
+        Logger.debug("Timed out requesting line count from runner #{inspect(runner_pid)}")
+        0
+    end
   end
 
   defp extract_task_id(%{request: %{id: id}}), do: id
