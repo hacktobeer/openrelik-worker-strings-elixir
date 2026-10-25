@@ -16,7 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /openrelik
 
 ENV MIX_ENV=prod
-
 # Install Hex and Rebar
 RUN mix local.hex --force && mix local.rebar --force
 
@@ -34,25 +33,38 @@ RUN mix compile
 RUN mix release
 
 # ---------------------------------------------------------------------------
-# Runtime stage: OpenRelik worker built on an OTP release.
+# Runtime stage: OpenRelik worker on a self-contained OTP release.
 #
-# GNU `strings` (binutils) is required by the worker itself; the release
-# bundles its own ERTS runtime, so no Elixir toolchain is needed here. The
-# image reuses the same Debian base as the build stage to guarantee runtime
-# library compatibility with the compiled release.
+# The release bundles its own ERTS runtime, so no Elixir/Erlang toolchain is
+# required here. This stage uses the *same Debian release (trixie) as the
+# build stage* so the bundled BEAM links against a compatible glibc; it only
+# adds the minimal runtime bits:
+#   - binutils        : GNU `strings` (with --encoding support) used by the worker
+#   - ca-certificates : TLS trust store for Redis connections
+#   - libstdc++6, libtinfo6 : shared libraries linked by the bundled beam.smp
+#   - libssl3         : OpenSSL runtime required by OTP's `crypto` application
 # ---------------------------------------------------------------------------
-FROM elixir:1.20.4-otp-29-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# binutils provides GNU `strings` (with `--encoding` support)
+# UTF-8 locale (built into glibc, no extra package needed); the build base
+# image sets it too, and the BEAM prints a latin1-encoding warning without it.
+ENV LANG=C.UTF-8
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     binutils \
     ca-certificates \
+    libstdc++6 \
+    libtinfo6 \
+    libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the self-contained release into /opt/openrelik
-COPY --from=build /openrelik/_build/prod/rel/openrelik_worker_strings /opt/openrelik
+# Copy the self-contained release into /opt/openrelik, owned directly by the
+# non-root `openrelik` user (a `RUN chown -R` after COPY would duplicate the
+# whole release into an extra layer).
+COPY --from=build --chown=10001:10001 \
+    /openrelik/_build/prod/rel/openrelik_worker_strings /opt/openrelik
 
 # Non-root `openrelik` user and writable OpenRelik artifact volume directory.
 # When mounting a host volume over /usr/share/openrelik/data, ensure it is
@@ -61,7 +73,7 @@ COPY --from=build /openrelik/_build/prod/rel/openrelik_worker_strings /opt/openr
 RUN groupadd --gid 10001 openrelik \
     && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/openrelik openrelik \
     && mkdir -p /usr/share/openrelik/data \
-    && chown -R openrelik:openrelik /opt/openrelik /usr/share/openrelik/data
+    && chown openrelik:openrelik /usr/share/openrelik/data
 
 # Default Redis URL (override at runtime with `-e REDIS_URL=...`)
 ENV REDIS_URL="redis://localhost:6379/0"
