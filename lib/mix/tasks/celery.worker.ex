@@ -61,7 +61,7 @@ defmodule Mix.Tasks.Celery.Worker do
     # the configured worker child spec to OpenrelikWorkerStrings.Supervisor after
     # parsing CLI arguments, preventing a duplicate worker if `START_WORKER=true`
     # is also set in the environment.
-    Application.put_env(:openrelik_worker_strings, :cli_worker_mode, true)
+    OpenrelikWorkerStrings.Config.put_cli_worker_mode(true)
     Mix.Task.run("app.start")
 
     if app_mod = Keyword.get(opts, :app) do

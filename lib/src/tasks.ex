@@ -81,7 +81,7 @@ defmodule Src.Tasks do
      volume while recording the human-readable `display_name` and extension for database
      registration.
 
-  5. **Real-Time Progress Reporting (`send_event/3`) & Result Encoding (`TaskUtils.create_task_result/1`)**:
+  5. **Real-Time Progress Reporting (`Src.Events.send_event/3`) & Result Encoding** (`TaskUtils.create_task_result/1`):
      Long-running commands emit `"task-progress"` events over Celery's `celeryev` fanout
      exchange for `openrelik-mediator` and Flower, and return a Base64-encoded JSON result
      string when finished.
@@ -93,6 +93,8 @@ defmodule Src.Tasks do
   alias OpenrelikWorkerCommon.FileUtils
   alias OpenrelikWorkerCommon.FileUtils.OutputFile
   alias OpenrelikWorkerCommon.TaskUtils
+  alias OpenrelikWorkerStrings.Config
+  alias Src.Events
   alias Src.Tasks.StringsEncoding
 
   # Task name used to register and route the task to the "openrelik-worker-strings" queue.
@@ -119,8 +121,6 @@ defmodule Src.Tasks do
       }
     ]
   }
-
-  @default_progress_interval_ms 3_000
 
   @doc "Returns the registered Celery task name (`\"openrelik-worker-strings.tasks.strings\"`)."
   @spec task_name() :: String.t()
@@ -210,50 +210,6 @@ defmodule Src.Tasks do
     )
   end
 
-  @doc """
-  Emits a Celery task event (such as `"task-progress"`), matching `self.send_event(...)`
-  in Python Celery.
-
-  On Redis brokers, `Celery.Events.exchange/1` publishes the event over the `celeryev`
-  fanout exchange (`/0.celeryev/task.progress`) so both OpenRelik Mediator and Flower
-  receive real-time task progress updates.
-  """
-  @spec send_event(Celery.Task.t() | nil, String.t(), keyword() | map()) :: {:ok, map()}
-  def send_event(self_task, event_type, fields \\ []) when is_binary(event_type) do
-    fields_map =
-      fields
-      |> Enum.into(%{})
-      |> Map.new(fn {k, v} -> {to_string(k), v} end)
-
-    task_id = extract_task_id(self_task)
-
-    hostname =
-      case self_task do
-        %{request: %{hostname: h}} when is_binary(h) and h != "" -> h
-        _ -> default_hostname()
-      end
-
-    event =
-      %{
-        "type" => event_type,
-        "uuid" => task_id,
-        "hostname" => hostname,
-        "timestamp" => System.system_time(:microsecond) / 1_000_000.0,
-        "utcoffset" => 0,
-        "pid" => System.pid() |> String.to_integer()
-      }
-      |> Map.merge(fields_map)
-
-    Logger.debug(
-      "Sending Celery event #{inspect(event_type)} (task_id=#{inspect(task_id)}, fields=#{inspect(fields_map)})"
-    )
-
-    notify_event_handler(event_type, event)
-    maybe_publish_celery_event(self_task, event_type, event)
-
-    {:ok, event}
-  end
-
   # --- Internal Helpers ---
 
   # Runs GNU `strings` for a single input file + encoding and returns its serialized
@@ -281,7 +237,7 @@ defmodule Src.Tasks do
     #   -t d             : Prefix each string with its byte offset in decimal
     #   --encoding <flag>: Character encoding ("s" for 7-bit ASCII, "l" for 16-bit UTF-16LE)
     command = [
-      strings_executable(),
+      Config.strings_executable(),
       "-a",
       "-t",
       "d",
@@ -353,7 +309,7 @@ defmodule Src.Tasks do
       end)
 
     start_time_us = System.monotonic_time(:microsecond)
-    update_interval_ms = update_interval_ms()
+    update_interval_ms = Config.update_interval_ms()
 
     emit_progress(self_task, runner_pid, output_file_path, start_time_us)
 
@@ -553,7 +509,7 @@ defmodule Src.Tasks do
       "Progress poll for #{output_file_path}: extracted_strings=#{extracted_strings}, rate=#{rate}/s"
     )
 
-    send_event(
+    Events.send_event(
       self_task,
       "task-progress",
       data: %{"extracted_strings" => extracted_strings, "rate" => rate}
@@ -599,75 +555,5 @@ defmodule Src.Tasks do
     else
       enabled_entries
     end
-  end
-
-  defp strings_executable do
-    Application.get_env(:openrelik_worker_strings, :strings_executable, "strings")
-  end
-
-  defp update_interval_ms do
-    Application.get_env(
-      :openrelik_worker_strings,
-      :update_interval_ms,
-      @default_progress_interval_ms
-    )
-  end
-
-  # Notifies any local test listener registered via `:event_handler` application env.
-  defp notify_event_handler(event_type, event) do
-    case Application.get_env(:openrelik_worker_strings, :event_handler) do
-      pid when is_pid(pid) ->
-        send(pid, {:celery_event, event_type, event})
-
-      fun when is_function(fun, 2) ->
-        fun.(event_type, event)
-
-      fun when is_function(fun, 1) ->
-        fun.(event)
-
-      _ ->
-        :ok
-    end
-  end
-
-  # Publishes custom task events (e.g. `"task-progress"`) to the Celery event exchange
-  # when running against a live broker (`is_eager: false`).
-  defp maybe_publish_celery_event(
-         %Celery.Task{app: %Celery{} = app, request: %{is_eager: false}},
-         event_type,
-         event
-       ) do
-    try do
-      conn = Celery.AMQP.build_connection(app)
-
-      try do
-        exchange = Celery.Events.exchange(conn)
-        routing_key = String.replace(event_type, "-", ".")
-        producer = Kombu.Producer.new(conn, exchange: exchange, serializer: "json")
-
-        Kombu.Producer.publish(producer, event,
-          exchange: exchange,
-          routing_key: routing_key,
-          declare: [exchange],
-          serializer: "json"
-        )
-      after
-        Kombu.Connection.release(conn)
-      end
-    rescue
-      error ->
-        Logger.warning(
-          "Failed to publish Celery event #{inspect(event_type)} to broker: #{Exception.message(error)}"
-        )
-
-        :ok
-    end
-  end
-
-  defp maybe_publish_celery_event(_self_task, _event_type, _event), do: :ok
-
-  defp default_hostname do
-    {:ok, host} = :inet.gethostname()
-    "celery@#{List.to_string(host)}"
   end
 end

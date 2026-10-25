@@ -5,12 +5,19 @@ defmodule OpenrelikWorkerStrings do
 
   ## Architecture & Module Overview
 
+  - `OpenrelikWorkerStrings.Config` — Centralized environment variable and
+    application config resolution (`REDIS_URL`, `WORKER_SHUTDOWN_TIMEOUT_MS`,
+    `START_WORKER`/`WORKER_CONCURRENCY`/`WORKER_QUEUES`, `strings(1)` executable
+    and progress interval settings).
   - `Src.App` — Configures the `%Celery{}` application (`REDIS_URL` broker/backend,
     `"openrelik-worker-strings"` queue routing, and `WORKER_SHUTDOWN_TIMEOUT_MS`
     graceful shutdown configuration) and builds/starts `Celery.Worker`.
   - `Src.Tasks` — Defines the `"openrelik-worker-strings.tasks.strings"` Celery task,
     its OpenRelik UI metadata (`@task_metadata`), subprocess execution, and real-time
     `"task-progress"` event reporting.
+  - `Src.Events` — Celery event emission plumbing (`send_event/3`, matching
+    `self.send_event(...)` in Python Celery) publishing to the `celeryev` exchange
+    for OpenRelik Mediator and Flower.
   - `OpenrelikWorkerCommon` (`:openrelik_worker_common` Hex package) — Shared OpenRelik
     worker utilities (`OpenrelikWorkerCommon.FileUtils` and `OpenrelikWorkerCommon.TaskUtils`)
     for resolving chained (`pipe_result`) or direct (`input_files`) workflow inputs,

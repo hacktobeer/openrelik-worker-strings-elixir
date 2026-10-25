@@ -28,6 +28,8 @@ defmodule OpenrelikWorkerStrings.Application do
   use Application
   require Logger
 
+  alias OpenrelikWorkerStrings.Config
+
   @impl true
   def start(_type, _args) do
     Logger.info("Starting OpenrelikWorkerStrings.Application")
@@ -39,10 +41,10 @@ defmodule OpenrelikWorkerStrings.Application do
     Logger.info("Registered Celery tasks: #{inspect(registered_tasks)}")
 
     children =
-      if start_supervised_worker?() do
-        concurrency = parse_worker_concurrency(System.get_env("WORKER_CONCURRENCY"))
-        queues = Src.App.resolve_queues(System.get_env("WORKER_QUEUES"))
-        shutdown_timeout = Src.App.shutdown_timeout_ms()
+      if Config.start_worker?() and not Config.cli_worker_mode?() do
+        concurrency = Config.worker_concurrency()
+        queues = Src.App.resolve_queues(Config.worker_queues())
+        shutdown_timeout = Config.shutdown_timeout_ms()
 
         Logger.info(
           "Starting supervised Celery.Worker " <>
@@ -68,22 +70,10 @@ defmodule OpenrelikWorkerStrings.Application do
     Supervisor.start_link(children, opts)
   end
 
-  # When launched via `mix celery.worker`, `:cli_worker_mode` is set to `true` so
-  # `Mix.Tasks.Celery.Worker` attaches the worker child spec to `OpenrelikWorkerStrings.Supervisor`
-  # using its parsed CLI flags, preventing a duplicate worker from being started if
-  # `START_WORKER=true` is also present in the container environment.
-  defp start_supervised_worker? do
-    not Application.get_env(:openrelik_worker_strings, :cli_worker_mode, false) and
-      (Application.get_env(:openrelik_worker_strings, :start_worker, false) or
-         System.get_env("START_WORKER") in ["1", "true", "TRUE"])
-  end
-
-  defp parse_worker_concurrency(nil), do: 1
-
-  defp parse_worker_concurrency(value) when is_binary(value) do
-    case Integer.parse(String.trim(value)) do
-      {n, ""} when n > 0 -> n
-      _ -> 1
-    end
-  end
+  # A supervised worker is started only when `Config.start_worker?/0` is enabled
+  # and the application was not launched via `mix celery.worker`. When launched
+  # via `mix celery.worker` (`Config.put_cli_worker_mode(true)`), `Mix.Tasks.Celery.Worker`
+  # attaches the worker child spec to `OpenrelikWorkerStrings.Supervisor` using
+  # its parsed CLI flags instead, preventing a duplicate worker from being
+  # started if `START_WORKER=true` is also present in the container environment.
 end
