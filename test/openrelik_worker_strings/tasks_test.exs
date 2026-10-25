@@ -1,10 +1,10 @@
-defmodule Src.TasksTest do
+defmodule OpenrelikWorkerStrings.TasksTest do
   use ExUnit.Case, async: false
 
   alias OpenrelikWorkerCommon.TaskUtils
-  alias Src.App
-  alias Src.Tasks
-  alias Src.Tasks.StringsEncoding
+  alias OpenrelikWorkerStrings.CeleryApp
+  alias OpenrelikWorkerStrings.Tasks
+  alias OpenrelikWorkerStrings.Tasks.StringsEncoding
 
   setup %{tmp_dir: tmp_dir} do
     # Create a portable GNU `strings` shim executable in tmp_dir that validates
@@ -27,6 +27,7 @@ defmodule Src.TasksTest do
     fi
     echo "0 extracted_${ENC}_line_1 from $(basename "$FILE")"
     echo "16 extracted_${ENC}_line_2 from $(basename "$FILE")"
+    exit "${STRINGS_SHIM_EXIT:-0}"
     """
 
     File.write!(shim_path, shim_script)
@@ -42,6 +43,7 @@ defmodule Src.TasksTest do
       Application.delete_env(:openrelik_worker_strings, :event_handler)
       System.delete_env("STRINGS_SHIM_SLEEP")
       System.delete_env("STRINGS_SHIM_EMPTY_ENC")
+      System.delete_env("STRINGS_SHIM_EXIT")
     end)
 
     :ok
@@ -61,7 +63,7 @@ defmodule Src.TasksTest do
 
   @tag :tmp_dir
   test "task registration and metadata match Python openrelik-worker-strings" do
-    app = App.celery()
+    app = CeleryApp.celery()
     assert Tasks.task_name() == "openrelik-worker-strings.tasks.strings"
 
     {:ok, defn} = Celery.Registry.lookup("openrelik-worker-strings.tasks.strings", app)
@@ -82,6 +84,15 @@ defmodule Src.TasksTest do
   } do
     System.put_env("STRINGS_SHIM_SLEEP", "0.05")
 
+    # Run both (encoding × input file) extraction jobs in parallel so the
+    # bounded-concurrency `Task.async_stream` path is exercised. Progress
+    # events are tagged per output file to stay unambiguous under parallelism.
+    Application.put_env(:openrelik_worker_strings, :extraction_concurrency, 2)
+
+    on_exit(fn ->
+      Application.delete_env(:openrelik_worker_strings, :extraction_concurrency)
+    end)
+
     input_path = Path.join(tmp_dir, "sample.bin")
     File.write!(input_path, "hello world\n")
 
@@ -100,7 +111,7 @@ defmodule Src.TasksTest do
       "UTF16LE" => true
     }
 
-    app = App.celery(task_always_eager: true, task_eager_propagates: true)
+    app = CeleryApp.celery(task_always_eager: true, task_eager_propagates: true)
 
     {:ok, async_res} =
       Celery.send_task(app, Tasks.task_name(),
@@ -124,6 +135,7 @@ defmodule Src.TasksTest do
 
     ascii_out = Map.fetch!(by_display_name, "sample.bin.ASCII_strings")
     assert ascii_out["extension"] == ".ASCII_strings"
+    assert ascii_out["data_type"] == "text/plain"
     assert File.read!(ascii_out["path"]) =~ "extracted_s_line_1 from sample.bin"
 
     utf16_out = Map.fetch!(by_display_name, "sample.bin.UTF16LE_strings")
@@ -133,7 +145,12 @@ defmodule Src.TasksTest do
     assert_receive {:celery_event, "task-progress",
                     %{
                       "type" => "task-progress",
-                      "data" => %{"extracted_strings" => _, "rate" => _}
+                      "data" => %{
+                        "extracted_strings" => _,
+                        "rate" => _,
+                        "file" => "sample.bin",
+                        "encoding" => _
+                      }
                     }}
   end
 
@@ -155,7 +172,7 @@ defmodule Src.TasksTest do
         ]
       })
 
-    app = App.celery(task_always_eager: true, task_eager_propagates: true)
+    app = CeleryApp.celery(task_always_eager: true, task_eager_propagates: true)
 
     {:ok, async_res} =
       Tasks.apply_async(app, :strings,
@@ -176,7 +193,7 @@ defmodule Src.TasksTest do
 
   @tag :tmp_dir
   test "strings task raises RuntimeError on invalid StringsEncoding name", %{tmp_dir: tmp_dir} do
-    app = App.celery(task_always_eager: true, task_eager_propagates: true)
+    app = CeleryApp.celery(task_always_eager: true, task_eager_propagates: true)
 
     assert_raise RuntimeError, "BAD_ENC is not a valid StringsEncoding name", fn ->
       Celery.send_task(app, Tasks.task_name(),
@@ -201,7 +218,7 @@ defmodule Src.TasksTest do
     output_dir = Path.join(tmp_dir, "out_selective")
     File.mkdir_p!(output_dir)
 
-    app = App.celery(task_always_eager: true, task_eager_propagates: true)
+    app = CeleryApp.celery(task_always_eager: true, task_eager_propagates: true)
 
     # 1. When both checkboxes are nil (default OpenRelik workflow config with no encoding selected),
     #    default strings ("s") runs and output filename does NOT contain ASCII or UTF16LE.
@@ -267,9 +284,9 @@ defmodule Src.TasksTest do
   @tag :tmp_dir
   test "strings task raises RuntimeError when no input files are provided and returns empty output_files when 0 strings match",
        %{tmp_dir: tmp_dir} do
-    app = App.celery(task_always_eager: true, task_eager_propagates: true)
+    app = CeleryApp.celery(task_always_eager: true, task_eager_propagates: true)
 
-    assert_raise RuntimeError, "No strings extracted from the provided files.", fn ->
+    assert_raise RuntimeError, "No input files provided for the strings task.", fn ->
       Celery.send_task(app, Tasks.task_name(),
         kwargs: %{
           "input_files" => [],
@@ -306,6 +323,34 @@ defmodule Src.TasksTest do
   end
 
   @tag :tmp_dir
+  test "strings task raises RuntimeError and removes partial output when the subprocess exits non-zero",
+       %{tmp_dir: tmp_dir} do
+    System.put_env("STRINGS_SHIM_EXIT", "3")
+
+    input_path = Path.join(tmp_dir, "failing.bin")
+    File.write!(input_path, "partially extractable data\n")
+
+    output_dir = Path.join(tmp_dir, "out_fail")
+    File.mkdir_p!(output_dir)
+
+    app = CeleryApp.celery(task_always_eager: true, task_eager_propagates: true)
+
+    assert_raise RuntimeError, ~r/exited with non-zero status 3/, fn ->
+      Celery.send_task(app, Tasks.task_name(),
+        kwargs: %{
+          "input_files" => [%{"display_name" => "failing.bin", "path" => input_path}],
+          "output_path" => output_dir,
+          "workflow_id" => "wf-fail",
+          "task_config" => %{"ASCII" => true}
+        }
+      )
+    end
+
+    # The truncated output file written before the failure must have been removed.
+    assert File.ls!(output_dir) == []
+  end
+
+  @tag :tmp_dir
   test "Celery.Worker consumes and executes strings task over memory broker", %{tmp_dir: tmp_dir} do
     input_path = Path.join(tmp_dir, "worker_input.bin")
     File.write!(input_path, "worker test data\n")
@@ -313,13 +358,13 @@ defmodule Src.TasksTest do
     File.mkdir_p!(output_dir)
 
     app =
-      App.celery(
+      CeleryApp.celery(
         broker: "memory://",
         backend: nil
       )
 
     {:ok, worker} =
-      App.start_worker(
+      CeleryApp.start_worker(
         app: app,
         concurrency: 1,
         poll_interval: 10,
@@ -358,17 +403,17 @@ defmodule Src.TasksTest do
     end)
 
     System.delete_env("WORKER_SHUTDOWN_TIMEOUT_MS")
-    assert App.shutdown_timeout_ms() == 30_000
-    assert App.worker_child_spec().shutdown == 30_000
+    assert CeleryApp.shutdown_timeout_ms() == 30_000
+    assert CeleryApp.worker_child_spec().shutdown == 30_000
 
     System.put_env("WORKER_SHUTDOWN_TIMEOUT_MS", "60000")
-    assert App.shutdown_timeout_ms() == 60_000
-    assert App.worker_child_spec().shutdown == 60_000
+    assert CeleryApp.shutdown_timeout_ms() == 60_000
+    assert CeleryApp.worker_child_spec().shutdown == 60_000
 
     System.put_env("WORKER_SHUTDOWN_TIMEOUT_MS", "infinity")
-    assert App.shutdown_timeout_ms() == :infinity
-    assert App.worker_child_spec().shutdown == :infinity
+    assert CeleryApp.shutdown_timeout_ms() == :infinity
+    assert CeleryApp.worker_child_spec().shutdown == :infinity
 
-    assert App.worker_child_spec(shutdown: 15_000).shutdown == 15_000
+    assert CeleryApp.worker_child_spec(shutdown: 15_000).shutdown == 15_000
   end
 end

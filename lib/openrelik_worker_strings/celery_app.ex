@@ -1,4 +1,4 @@
-defmodule Src.App do
+defmodule OpenrelikWorkerStrings.CeleryApp do
   @moduledoc """
   Celery application and worker configuration for `openrelik-worker-strings`
   (Elixir port of `src/app.py`).
@@ -14,7 +14,7 @@ defmodule Src.App do
      OpenRelik Server discovers registered tasks via Celery's `inspect.registered`
      control command and automatically routes each task to the queue matching the
      first segment of its task name (`task_name.split(".")[0]`).
-     Because the task name in `Src.Tasks` is `"openrelik-worker-strings.tasks.strings"`,
+     Because the task name in `OpenrelikWorkerStrings.Tasks` is `"openrelik-worker-strings.tasks.strings"`,
      OpenRelik Server routes jobs to the `"openrelik-worker-strings"` queue.
 
   3. **Graceful Shutdown Timeout (`WORKER_SHUTDOWN_TIMEOUT_MS`)**:
@@ -27,97 +27,52 @@ defmodule Src.App do
 
   require Logger
 
-  @default_redis_url "redis://localhost:6379/0"
+  alias OpenrelikWorkerStrings.Config
+
   @default_queue "openrelik-worker-strings"
-  @default_shutdown_timeout_ms 30_000
-  @task_modules ["src.tasks"]
+  # Task module loaded into `Celery.Registry` (OpenRelik Server discovers the
+  # worker and its task_config via Celery's `inspect.registered` command).
+  @task_modules [OpenrelikWorkerStrings.Tasks]
 
   @doc """
   Returns the default OpenRelik queue name (`"openrelik-worker-strings"`).
 
-  In OpenRelik, this must match the prefix of `Src.Tasks.task_name/0` before the
+  In OpenRelik, this must match the prefix of `OpenrelikWorkerStrings.Tasks.task_name/0` before the
   first dot (`"openrelik-worker-strings.tasks.strings"` -> `"openrelik-worker-strings"`).
   """
   @spec default_queue() :: String.t()
   def default_queue, do: @default_queue
 
   @doc """
-  Returns the default OTP supervisor shutdown timeout in milliseconds (`30_000`).
+  Returns the documented default OTP supervisor shutdown timeout in milliseconds
+  (resolved by `OpenrelikWorkerStrings.Config`, `30_000`).
   """
   @spec default_shutdown_timeout_ms() :: pos_integer()
-  def default_shutdown_timeout_ms, do: @default_shutdown_timeout_ms
+  defdelegate default_shutdown_timeout_ms(), to: Config
 
   @doc """
   Resolves the OTP supervisor graceful shutdown timeout from the
   `WORKER_SHUTDOWN_TIMEOUT_MS` environment variable (or `:shutdown_timeout_ms`
-  application config), defaulting to `30_000` ms (30 seconds).
-
-  Also accepts `"infinity"` (returning `:infinity`).
+  application config) via `OpenrelikWorkerStrings.Config`, defaulting to
+  `30_000` ms (30 seconds). Also accepts `"infinity"` (returning `:infinity`).
   """
   @spec shutdown_timeout_ms() :: pos_integer() | :infinity
-  def shutdown_timeout_ms do
-    case System.get_env("WORKER_SHUTDOWN_TIMEOUT_MS") do
-      nil ->
-        Application.get_env(
-          :openrelik_worker_strings,
-          :shutdown_timeout_ms,
-          @default_shutdown_timeout_ms
-        )
-
-      raw ->
-        parse_shutdown_timeout(raw)
-    end
-  end
+  defdelegate shutdown_timeout_ms(), to: Config
 
   @doc """
-  Parses a shutdown timeout value (integer milliseconds, numeric string, or `"infinity"`),
-  falling back to `30_000` ms on invalid input.
+  Parses a shutdown timeout value (integer milliseconds, numeric string, or
+  `"infinity"`), falling back to `30_000` ms on invalid input.
   """
   @spec parse_shutdown_timeout(term()) :: pos_integer() | :infinity
-  def parse_shutdown_timeout(:infinity), do: :infinity
-  def parse_shutdown_timeout(ms) when is_integer(ms) and ms > 0, do: ms
-
-  def parse_shutdown_timeout(raw) when is_binary(raw) do
-    trimmed = String.trim(raw)
-
-    if String.downcase(trimmed) == "infinity" do
-      :infinity
-    else
-      case Integer.parse(trimmed) do
-        {ms, ""} when ms > 0 ->
-          ms
-
-        _ ->
-          Logger.warning(
-            "Invalid WORKER_SHUTDOWN_TIMEOUT_MS=#{inspect(raw)}; falling back to #{@default_shutdown_timeout_ms}ms"
-          )
-
-          @default_shutdown_timeout_ms
-      end
-    end
-  end
-
-  def parse_shutdown_timeout(_), do: @default_shutdown_timeout_ms
+  defdelegate parse_shutdown_timeout(value), to: Config
 
   @doc """
-  Returns the Redis URL from the `REDIS_URL` environment variable, falling back
-  to `"redis://localhost:6379/0"` when unset or empty.
+  Returns the Redis URL from the `REDIS_URL` environment variable via
+  `OpenrelikWorkerStrings.Config`, falling back to
+  `"redis://localhost:6379/0"` when unset or empty.
   """
   @spec redis_url() :: String.t()
-  def redis_url do
-    case System.get_env("REDIS_URL") do
-      url when is_binary(url) and url != "" ->
-        Logger.debug("Resolved REDIS_URL from environment: #{url}")
-        url
-
-      _ ->
-        Logger.debug(
-          "REDIS_URL environment variable not set; falling back to default #{@default_redis_url}"
-        )
-
-        @default_redis_url
-    end
-  end
+  defdelegate redis_url(), to: Config
 
   @doc """
   Normalizes a queue specification (nil, list of queue names, or comma-separated
@@ -140,7 +95,7 @@ defmodule Src.App do
 
   @doc """
   Builds a `%Celery{}` application instance configured with `REDIS_URL` as both
-  broker and result backend, and `include: ["src.tasks"]`.
+  broker and result backend, and `include: ["OpenrelikWorkerStrings.Tasks"]`.
 
   ## Options
   - `:redis_url` - Explicit Redis URL (defaults to `redis_url/0`).

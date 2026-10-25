@@ -1,4 +1,4 @@
-defmodule Src.Tasks.StringsEncoding do
+defmodule OpenrelikWorkerStrings.Tasks.StringsEncoding do
   @moduledoc """
   Supported string encodings and their corresponding GNU `strings(1)` `--encoding`
   flag values (ported from `StringsEncoding` in `src/tasks.py`).
@@ -50,7 +50,7 @@ defmodule Src.Tasks.StringsEncoding do
   end
 end
 
-defmodule Src.Tasks do
+defmodule OpenrelikWorkerStrings.Tasks do
   @moduledoc """
   OpenRelik Celery task implementation for `openrelik-worker-strings`
   (Elixir port of `src/tasks.py`).
@@ -78,10 +78,10 @@ defmodule Src.Tasks do
 
   4. **Output File Creation (`FileUtils.create_output_file/2`)**:
      Generates a UUID-named file path inside `output_path` on the shared OpenRelik artifact
-     volume while recording the human-readable `display_name` and extension for database
-     registration.
+     volume while recording the human-readable `display_name`, `data_type`, and extension
+     for database registration.
 
-  5. **Real-Time Progress Reporting (`send_event/3`) & Result Encoding (`TaskUtils.create_task_result/1`)**:
+  5. **Real-Time Progress Reporting (`OpenrelikWorkerStrings.Events.send_event/3`) & Result Encoding** (`TaskUtils.create_task_result/1`):
      Long-running commands emit `"task-progress"` events over Celery's `celeryev` fanout
      exchange for `openrelik-mediator` and Flower, and return a Base64-encoded JSON result
      string when finished.
@@ -93,7 +93,9 @@ defmodule Src.Tasks do
   alias OpenrelikWorkerCommon.FileUtils
   alias OpenrelikWorkerCommon.FileUtils.OutputFile
   alias OpenrelikWorkerCommon.TaskUtils
-  alias Src.Tasks.StringsEncoding
+  alias OpenrelikWorkerStrings.Config
+  alias OpenrelikWorkerStrings.Events
+  alias OpenrelikWorkerStrings.Tasks.StringsEncoding
 
   # Task name used to register and route the task to the "openrelik-worker-strings" queue.
   @task_name "openrelik-worker-strings.tasks.strings"
@@ -119,8 +121,6 @@ defmodule Src.Tasks do
       }
     ]
   }
-
-  @default_progress_interval_ms 3_000
 
   @doc "Returns the registered Celery task name (`\"openrelik-worker-strings.tasks.strings\"`)."
   @spec task_name() :: String.t()
@@ -172,7 +172,7 @@ defmodule Src.Tasks do
     if resolved_input_files == [] do
       Logger.error("Task #{@task_name} (task_id=#{inspect(task_id)}) received no input files")
 
-      raise RuntimeError, "No strings extracted from the provided files."
+      raise RuntimeError, "No input files provided for the strings task."
     end
 
     config_entries = normalize_task_config(task_config)
@@ -182,14 +182,7 @@ defmodule Src.Tasks do
     # Run extraction for the selected encodings (or default ASCII with `.strings` naming
     # if no encoding options were selected in the UI), and only register output files
     # where `strings` extracted data (`size > 0`).
-    output_files =
-      for {encoding_name, encoding_flag} <- config_entries,
-          input_file <- resolved_input_files,
-          output_file =
-            extract_strings_for_file(self, input_file, output_path, encoding_name, encoding_flag),
-          not is_nil(output_file) do
-        output_file
-      end
+    output_files = run_extractions(self, resolved_input_files, output_path, config_entries)
 
     if output_files == [] do
       Logger.info(
@@ -210,51 +203,76 @@ defmodule Src.Tasks do
     )
   end
 
-  @doc """
-  Emits a Celery task event (such as `"task-progress"`), matching `self.send_event(...)`
-  in Python Celery.
+  # --- Internal Helpers ---
 
-  On Redis brokers, `Celery.Events.exchange/1` publishes the event over the `celeryev`
-  fanout exchange (`/0.celeryev/task.progress`) so both OpenRelik Mediator and Flower
-  receive real-time task progress updates.
-  """
-  @spec send_event(Celery.Task.t() | nil, String.t(), keyword() | map()) :: {:ok, map()}
-  def send_event(self_task, event_type, fields \\ []) when is_binary(event_type) do
-    fields_map =
-      fields
-      |> Enum.into(%{})
-      |> Map.new(fn {k, v} -> {to_string(k), v} end)
-
-    task_id = extract_task_id(self_task)
-
-    hostname =
-      case self_task do
-        %{request: %{hostname: h}} when is_binary(h) and h != "" -> h
-        _ -> default_hostname()
+  # Runs extraction for all (encoding, input file) pairs via
+  # `Task.Supervisor.async_stream_nolink` with bounded concurrency
+  # (`Config.extraction_concurrency/0`, default `1` for parity with the serial
+  # Python worker), keeping `"task-progress"` events tagged per output file.
+  # Results are collected in deterministic job order, and a failing extraction
+  # (non-zero `strings` exit status or runner crash) re-raises in the task
+  # process after the stream completes, aborting the task so no partial
+  # outputs are registered.
+  defp run_extractions(self_task, input_files, output_path, config_entries) do
+    jobs =
+      for {encoding_name, encoding_flag} <- config_entries,
+          input_file <- input_files do
+        {input_file, encoding_name, encoding_flag}
       end
 
-    event =
-      %{
-        "type" => event_type,
-        "uuid" => task_id,
-        "hostname" => hostname,
-        "timestamp" => System.system_time(:microsecond) / 1_000_000.0,
-        "utcoffset" => 0,
-        "pid" => System.pid() |> String.to_integer()
-      }
-      |> Map.merge(fields_map)
+    max_concurrency = min(Config.extraction_concurrency(), length(jobs))
 
     Logger.debug(
-      "Sending Celery event #{inspect(event_type)} (task_id=#{inspect(task_id)}, fields=#{inspect(fields_map)})"
+      "Running #{length(jobs)} strings extraction job(s) " <>
+        "(max_concurrency=#{max_concurrency})"
     )
 
-    notify_event_handler(event_type, event)
-    maybe_publish_celery_event(self_task, event_type, event)
+    results =
+      Task.Supervisor.async_stream_nolink(
+        OpenrelikWorkerStrings.TaskSupervisor,
+        jobs,
+        fn {input_file, encoding_name, encoding_flag} ->
+          extract_strings_for_file(
+            self_task,
+            input_file,
+            output_path,
+            encoding_name,
+            encoding_flag
+          )
+        end,
+        max_concurrency: max_concurrency,
+        ordered: true,
+        timeout: :infinity
+      )
 
-    {:ok, event}
+    Enum.flat_map(results, &collect_extraction_result/1)
   end
 
-  # --- Internal Helpers ---
+  # Flattens one bounded-concurrency stream result: skips `nil` (no strings
+  # extracted / skipped), keeps successful serialized output file maps, and
+  # re-raises extraction worker crashes in the task process so the task fails
+  # (matching the serial failure semantics of the pre-parallel implementation).
+  defp collect_extraction_result({ok_result, nil}) when ok_result in [:ok, :exit] do
+    []
+  end
+
+  defp collect_extraction_result({:ok, output_file}) do
+    [output_file]
+  end
+
+  defp collect_extraction_result({:exit, {exception, stacktrace}})
+       when is_exception(exception) and is_list(stacktrace) do
+    reraise exception, stacktrace
+  end
+
+  defp collect_extraction_result({:exit, {reason, stacktrace}}) when is_list(stacktrace) do
+    raise RuntimeError,
+          "strings extraction worker exited unexpectedly: #{inspect({reason, stacktrace})}"
+  end
+
+  defp collect_extraction_result({:exit, reason}) do
+    raise RuntimeError, "strings extraction worker exited unexpectedly: #{inspect(reason)}"
+  end
 
   # Runs GNU `strings` for a single input file + encoding and returns its serialized
   # `OutputFile.to_dict/1` map.
@@ -273,7 +291,8 @@ defmodule Src.Tasks do
     output_file =
       FileUtils.create_output_file(
         output_path || "",
-        display_name: output_display_name
+        display_name: output_display_name,
+        data_type: "text/plain"
       )
 
     # Flags passed to GNU `strings`:
@@ -281,7 +300,7 @@ defmodule Src.Tasks do
     #   -t d             : Prefix each string with its byte offset in decimal
     #   --encoding <flag>: Character encoding ("s" for 7-bit ASCII, "l" for 16-bit UTF-16LE)
     command = [
-      strings_executable(),
+      Config.strings_executable(),
       "-a",
       "-t",
       "d",
@@ -296,7 +315,12 @@ defmodule Src.Tasks do
         "command=#{inspect(Enum.join(command, " "))})"
     )
 
-    run_command_with_progress(self_task, command, output_file.path)
+    run_command_with_progress(
+      self_task,
+      command,
+      output_file.path,
+      progress_fields(display_name, encoding_label)
+    )
 
     case File.stat(output_file.path) do
       {:ok, %File.Stat{size: size}} when size > 0 ->
@@ -323,8 +347,19 @@ defmodule Src.Tasks do
 
   # Spawns the external `strings` executable, streams its standard output directly to
   # `output_file_path` (creating the file on disk only when output bytes are produced),
-  # and periodically emits `"task-progress"` events until the command exits.
-  defp run_command_with_progress(self_task, [executable | args], output_file_path) do
+  # and periodically emits `"task-progress"` events until the command exits. Events
+  # are tagged with `progress_fields` (input file display name and encoding label)
+  # so progress is unambiguous when extractions run in parallel.
+  #
+  # Raises `RuntimeError` when the `strings` subprocess exits with a non-zero status
+  # or when the runner process crashes, so partially written output is never
+  # registered as a successful artifact.
+  defp run_command_with_progress(
+         self_task,
+         [executable | args],
+         output_file_path,
+         progress_fields
+       ) do
     output_file_path |> Path.dirname() |> File.mkdir_p!()
 
     exec_path =
@@ -341,102 +376,205 @@ defmodule Src.Tasks do
       "Spawning strings subprocess: #{exec_path} #{Enum.join(args, " ")} -> #{output_file_path}"
     )
 
+    parent = self()
+
     {runner_pid, mon_ref} =
       spawn_monitor(fn ->
-        stream_port_to_file(exec_path, args, output_file_path)
+        stream_port_to_file(parent, exec_path, args, output_file_path)
       end)
 
     start_time_us = System.monotonic_time(:microsecond)
-    update_interval_ms = update_interval_ms()
+    update_interval_ms = Config.update_interval_ms()
 
-    poll_until_finished(
+    emit_progress(self_task, runner_pid, output_file_path, start_time_us, progress_fields)
+
+    await_command_completion(
       self_task,
       runner_pid,
       mon_ref,
       output_file_path,
       start_time_us,
-      update_interval_ms
+      update_interval_ms,
+      progress_fields
     )
   end
 
-  defp stream_port_to_file(exec_path, args, output_file_path) do
+  # Runner process entry point: opens the port, streams its data to
+  # `output_file_path` while counting lines incrementally, and reports the
+  # final `{:strings_exited, {:ok, line_count} | {:error, reason}}` result to
+  # `parent` before exiting cleanly.
+  defp stream_port_to_file(parent, exec_path, args, output_file_path) do
     port =
       Port.open(
         {:spawn_executable, exec_path},
         [:binary, :exit_status, {:args, args}]
       )
 
-    collect_port_output(port, nil, output_file_path)
+    {exit_status, line_count} = collect_port_output(port, parent, nil, output_file_path, 0)
+
+    result =
+      if exit_status == 0 do
+        {:ok, line_count}
+      else
+        {:error, {:exit_status, exit_status}}
+      end
+
+    Logger.debug(
+      "Strings subprocess exited with status #{exit_status} and #{line_count} line(s) " <>
+        "(output=#{output_file_path})"
+    )
+
+    send(parent, {self(), {:strings_exited, result}})
   end
 
-  defp collect_port_output(port, file, output_file_path) do
+  # Streams port data to `output_file_path`, counting newline occurrences
+  # incrementally (matching `wc -l` semantics used by
+  # `FileUtils.count_file_lines/1`) so progress events do not need to re-read the
+  # output file, and answers `{:get_counts, reply_ref}` requests from the
+  # polling (task) process with the current line count.
+  defp collect_port_output(port, parent, file, output_file_path, line_count) do
     receive do
       {^port, {:data, ""}} ->
-        collect_port_output(port, file, output_file_path)
+        collect_port_output(port, parent, file, output_file_path, line_count)
 
       {^port, {:data, chunk}} ->
         file = file || File.open!(output_file_path, [:write, :binary])
         IO.binwrite(file, chunk)
-        collect_port_output(port, file, output_file_path)
 
-      {^port, {:exit_status, 0}} ->
-        if file, do: File.close(file)
-        Logger.debug("Strings subprocess exited with status 0 (output=#{output_file_path})")
-        :ok
+        collect_port_output(
+          port,
+          parent,
+          file,
+          output_file_path,
+          line_count + count_newlines(chunk)
+        )
 
       {^port, {:exit_status, status}} ->
         if file, do: File.close(file)
+        {status, line_count}
 
+      {^parent, {:get_counts, reply_ref}} ->
+        send(parent, {reply_ref, line_count})
+        collect_port_output(port, parent, file, output_file_path, line_count)
+    end
+  end
+
+  defp count_newlines(chunk) when is_binary(chunk) do
+    byte_size(chunk) - byte_size(:binary.replace(chunk, "\n", "", [:global]))
+  end
+
+  # Awaits the completion of the monitored subprocess runner while emitting
+  # `"task-progress"` events every `update_interval_ms`, waking up immediately
+  # when the runner reports completion or exits (`{:DOWN, ...}`).
+  defp await_command_completion(
+         self_task,
+         runner_pid,
+         mon_ref,
+         output_file_path,
+         start_time_us,
+         update_interval_ms,
+         progress_fields
+       ) do
+    receive do
+      {^runner_pid, {:strings_exited, {:ok, _line_count}}} ->
+        ensure_runner_down(mon_ref, runner_pid)
+
+      {^runner_pid, {:strings_exited, {:error, reason}}} ->
+        ensure_runner_down(mon_ref, runner_pid)
+        cleanup_partial_output(output_file_path)
+
+        raise RuntimeError, strings_failure_message(reason, output_file_path)
+
+      {:DOWN, ^mon_ref, :process, ^runner_pid, :normal} ->
+        # Safeguard in case the runner exits before its result message is
+        # observed; peek briefly for a queued result before assuming success.
+        receive do
+          {^runner_pid, {:strings_exited, {:ok, _line_count}}} ->
+            :ok
+
+          {^runner_pid, {:strings_exited, {:error, reason}}} ->
+            cleanup_partial_output(output_file_path)
+            raise RuntimeError, strings_failure_message(reason, output_file_path)
+        after
+          5_000 ->
+            :ok
+        end
+
+      {:DOWN, ^mon_ref, :process, ^runner_pid, reason} ->
+        cleanup_partial_output(output_file_path)
+
+        raise RuntimeError,
+              "strings runner process exited unexpectedly " <>
+                "(#{format_exit_reason(reason)}; output=#{output_file_path})"
+    after
+      update_interval_ms ->
+        emit_progress(self_task, runner_pid, output_file_path, start_time_us, progress_fields)
+
+        await_command_completion(
+          self_task,
+          runner_pid,
+          mon_ref,
+          output_file_path,
+          start_time_us,
+          update_interval_ms,
+          progress_fields
+        )
+    end
+  end
+
+  # Waits for the monitored runner process to terminate after it reported its
+  # final result, so no stale `{:DOWN, ...}` message is left in the caller's
+  # mailbox.
+  defp ensure_runner_down(mon_ref, runner_pid) do
+    receive do
+      {:DOWN, ^mon_ref, :process, ^runner_pid, _reason} ->
+        :ok
+    after
+      5_000 ->
+        :ok
+    end
+  end
+
+  # Deletes a truncated output file produced by a failed `strings` subprocess so
+  # partial data is never left on disk or registered downstream.
+  defp cleanup_partial_output(output_file_path) do
+    case File.rm(output_file_path) do
+      :ok ->
+        Logger.info(
+          "Removed partial strings output file after subprocess failure: #{output_file_path}"
+        )
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
         Logger.warning(
-          "Strings subprocess exited with non-zero status #{status} (output=#{output_file_path})"
+          "Failed to remove partial strings output file #{output_file_path}: #{inspect(reason)}"
         )
 
         :ok
     end
   end
 
-  # Emits `"task-progress"` events every `update_interval_ms` while the subprocess is
-  # alive, waking up immediately when the monitored subprocess exits (`{:DOWN, ...}`)
-  # instead of blocking for the remainder of the sleep interval.
-  defp poll_until_finished(
-         self_task,
-         runner_pid,
-         mon_ref,
-         output_file_path,
-         start_time_us,
-         update_interval_ms
-       ) do
-    receive do
-      {:DOWN, ^mon_ref, :process, ^runner_pid, _reason} ->
-        :ok
-    after
-      0 ->
-        emit_progress(self_task, output_file_path, start_time_us)
-
-        receive do
-          {:DOWN, ^mon_ref, :process, ^runner_pid, _reason} ->
-            :ok
-        after
-          update_interval_ms ->
-            poll_until_finished(
-              self_task,
-              runner_pid,
-              mon_ref,
-              output_file_path,
-              start_time_us,
-              update_interval_ms
-            )
-        end
-    end
+  defp strings_failure_message({:exit_status, status}, output_file_path) do
+    "strings command exited with non-zero status #{status} (output=#{output_file_path})"
   end
 
-  defp emit_progress(self_task, output_file_path, start_time_us) do
-    extracted_strings =
-      if File.exists?(output_file_path) do
-        FileUtils.count_file_lines(output_file_path)
-      else
-        0
-      end
+  defp format_exit_reason({exception, stacktrace})
+       when is_exception(exception) and is_list(stacktrace) do
+    Exception.format_banner(:error, exception, stacktrace)
+  rescue
+    _ -> inspect({exception, stacktrace})
+  end
+
+  defp format_exit_reason(reason), do: inspect(reason)
+
+  # Emits a `"task-progress"` event reporting the incremental line count tracked
+  # by the running subprocess (no full file re-read), the extraction rate, and
+  # the `progress_fields` (input file display name and encoding label) that
+  # identify this extraction when several run in parallel.
+  defp emit_progress(self_task, runner_pid, output_file_path, start_time_us, progress_fields) do
+    extracted_strings = get_line_count(runner_pid)
 
     duration_s = (System.monotonic_time(:microsecond) - start_time_us) / 1_000_000.0
 
@@ -451,11 +589,36 @@ defmodule Src.Tasks do
       "Progress poll for #{output_file_path}: extracted_strings=#{extracted_strings}, rate=#{rate}/s"
     )
 
-    send_event(
+    Events.send_event(
       self_task,
       "task-progress",
-      data: %{"extracted_strings" => extracted_strings, "rate" => rate}
+      data:
+        Map.merge(progress_fields, %{
+          "extracted_strings" => extracted_strings,
+          "rate" => rate
+        })
     )
+  end
+
+  defp progress_fields(display_name, encoding_label) do
+    %{"file" => display_name, "encoding" => encoding_label}
+  end
+
+  # Requests the current incremental line count from the runner process.
+  # Falls back to `0` (with a debug log) when the runner is already gone —
+  # completion is handled via the `{:DOWN, ...}`/result messages instead.
+  defp get_line_count(runner_pid) do
+    reply_ref = make_ref()
+    send(runner_pid, {self(), {:get_counts, reply_ref}})
+
+    receive do
+      {^reply_ref, count} when is_integer(count) ->
+        count
+    after
+      1_000 ->
+        Logger.debug("Timed out requesting line count from runner #{inspect(runner_pid)}")
+        0
+    end
   end
 
   defp extract_task_id(%{request: %{id: id}}), do: id
@@ -480,75 +643,5 @@ defmodule Src.Tasks do
     else
       enabled_entries
     end
-  end
-
-  defp strings_executable do
-    Application.get_env(:openrelik_worker_strings, :strings_executable, "strings")
-  end
-
-  defp update_interval_ms do
-    Application.get_env(
-      :openrelik_worker_strings,
-      :update_interval_ms,
-      @default_progress_interval_ms
-    )
-  end
-
-  # Notifies any local test listener registered via `:event_handler` application env.
-  defp notify_event_handler(event_type, event) do
-    case Application.get_env(:openrelik_worker_strings, :event_handler) do
-      pid when is_pid(pid) ->
-        send(pid, {:celery_event, event_type, event})
-
-      fun when is_function(fun, 2) ->
-        fun.(event_type, event)
-
-      fun when is_function(fun, 1) ->
-        fun.(event)
-
-      _ ->
-        :ok
-    end
-  end
-
-  # Publishes custom task events (e.g. `"task-progress"`) to the Celery event exchange
-  # when running against a live broker (`is_eager: false`).
-  defp maybe_publish_celery_event(
-         %Celery.Task{app: %Celery{} = app, request: %{is_eager: false}},
-         event_type,
-         event
-       ) do
-    try do
-      conn = Celery.AMQP.build_connection(app)
-
-      try do
-        exchange = Celery.Events.exchange(conn)
-        routing_key = String.replace(event_type, "-", ".")
-        producer = Kombu.Producer.new(conn, exchange: exchange, serializer: "json")
-
-        Kombu.Producer.publish(producer, event,
-          exchange: exchange,
-          routing_key: routing_key,
-          declare: [exchange],
-          serializer: "json"
-        )
-      after
-        Kombu.Connection.release(conn)
-      end
-    rescue
-      error ->
-        Logger.warning(
-          "Failed to publish Celery event #{inspect(event_type)} to broker: #{Exception.message(error)}"
-        )
-
-        :ok
-    end
-  end
-
-  defp maybe_publish_celery_event(_self_task, _event_type, _event), do: :ok
-
-  defp default_hostname do
-    {:ok, host} = :inet.gethostname()
-    "celery@#{List.to_string(host)}"
   end
 end
